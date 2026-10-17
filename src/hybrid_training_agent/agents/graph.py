@@ -20,12 +20,15 @@ from hybrid_training_agent.agents.prompts import (
 )
 from hybrid_training_agent.config import get_chat_model, get_settings
 from hybrid_training_agent.tools.analytics_tools import (
+    PERFORMANCE_ANALYSIS_TOOLS,
     analyze_training_and_wellness,
     fetch_athlete_profile_and_zones,
 )
 from hybrid_training_agent.tools.planner_tools import (
+    PLANNER_LIBRARY_TOOLS,
     delete_planned_event_from_intervals,
     get_upcoming_intervals_calendar,
+    update_calendar_event,
     upload_training_plan_to_intervals,
     validate_and_preview_training_plan,
 )
@@ -39,6 +42,52 @@ AgentName = Literal["analyst", "researcher", "planner", "FINISH"]
 # Wording that means the athlete will manage the intervals.icu calendar, so the planner
 # needs the delete tool bound (otherwise it is left out of the request payload).
 _PLANNER_DELETE_KEYWORDS = ("delete", "remove", "cancel", "unplan", "clear the calendar")
+_PLANNER_UPDATE_KEYWORDS = (
+    "move",
+    "reschedule",
+    "shift",
+    "postpone",
+    "rename",
+    "edit the",
+    "change the",
+    "update the",
+    "swap",
+)
+_PLANNER_LIBRARY_KEYWORDS = (
+    "library",
+    "template",
+    "folder",
+    "save to",
+    "save it",
+    "save this",
+    "apply plan",
+    "apply the plan",
+    "apply my plan",
+    "from my plan",
+    "reuse",
+)
+# Deep-dive analysis is opt-in so routine readiness checks stay a single model call.
+_ANALYST_DEEP_KEYWORDS = (
+    "analy",
+    "performance",
+    "benchmark",
+    "curve",
+    "best effort",
+    "personal best",
+    "pb ",
+    "compare",
+    "execution",
+    "split",
+    "stream",
+    "decoupling",
+    "drift",
+    "efficiency",
+    "when did",
+    "similar session",
+    "how did",
+    "session review",
+    "interval analysis",
+)
 
 
 class RouteDecision(BaseModel):
@@ -253,12 +302,24 @@ def _detect_days_back(user_text: str, default: int = 28) -> int:
     return max(7, min(int(match.group(1)), 365))
 
 
+def _select_analyst_tools(user_text: str) -> list[BaseTool]:
+    """Bind the read-only benchmarking/execution tools only for analysis-style requests.
+
+    Routine readiness checks keep an empty tool list so the analyst answers in one model
+    call. Deep dives (session execution, PBs, curves, similar sessions) opt in explicitly.
+    """
+    lower = user_text.lower()
+    if any(kw in lower for kw in _ANALYST_DEEP_KEYWORDS):
+        return list(PERFORMANCE_ANALYSIS_TOOLS)
+    return []
+
+
 def _select_planner_tools(user_text: str) -> list[BaseTool]:
     """Bind only the planner tools the request can plausibly need.
 
     The intervals.icu calendar is pre-fetched, and the curated-evidence tool is only
     relevant when the researcher runs, so both are dropped from the request payload.
-    The delete tool is bound solely for calendar-removal requests.
+    Delete/update/library tools are bound solely for the requests that mention them.
     """
     tools: list[BaseTool] = [
         validate_and_preview_training_plan,
@@ -267,6 +328,10 @@ def _select_planner_tools(user_text: str) -> list[BaseTool]:
     lower = user_text.lower()
     if any(kw in lower for kw in _PLANNER_DELETE_KEYWORDS):
         tools.append(delete_planned_event_from_intervals)
+    if any(kw in lower for kw in _PLANNER_UPDATE_KEYWORDS):
+        tools.append(update_calendar_event)
+    if any(kw in lower for kw in _PLANNER_LIBRARY_KEYWORDS):
+        tools.extend(PLANNER_LIBRARY_TOOLS)
     return tools
 
 
@@ -422,7 +487,7 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
         new_msgs = _run_tool_calling_subagent(
             llm=model,
             system_prompt=ANALYST_SYSTEM_PROMPT,
-            tools=[],
+            tools=_select_analyst_tools(user_text),
             messages=state["messages"],
             agent_tag="Performance_and_Health_Analyst",
             context=context,

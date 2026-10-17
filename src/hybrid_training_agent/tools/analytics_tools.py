@@ -356,3 +356,265 @@ ANALYTICS_TOOLS = [
     fetch_athlete_profile_and_zones,
     analyze_training_and_wellness,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Performance benchmarking & session-execution analysis (read-only)
+# ---------------------------------------------------------------------------
+def _normalize_streams(streams: Any) -> dict[str, list[Any]]:
+    """Normalize intervals.icu stream payloads into `{stream_type: samples}`."""
+    normalized: dict[str, list[Any]] = {}
+    if isinstance(streams, dict):
+        popped = streams.get("streams")
+        if isinstance(popped, list):
+            streams = popped
+        else:
+            for key, value in streams.items():
+                if isinstance(value, list):
+                    normalized[str(key)] = value
+            return normalized
+    if isinstance(streams, list):
+        for item in streams:
+            if not isinstance(item, dict):
+                continue
+            stream_type = item.get("type") or item.get("name")
+            data = item.get("data")
+            if stream_type and isinstance(data, list):
+                normalized[str(stream_type)] = data
+    return normalized
+
+
+def _numeric_summary(values: list[Any]) -> dict[str, float] | None:
+    numbers = [float(v) for v in values if isinstance(v, (int, float))]
+    if not numbers:
+        return None
+    return {
+        "count": len(numbers),
+        "min": round(min(numbers), 2),
+        "max": round(max(numbers), 2),
+        "avg": round(sum(numbers) / len(numbers), 2),
+    }
+
+
+def _half_split_summary(values: list[Any]) -> dict[str, Any] | None:
+    numbers = [float(v) for v in values if isinstance(v, (int, float))]
+    if len(numbers) < 4:
+        return None
+    mid = len(numbers) // 2
+    first = sum(numbers[:mid]) / mid
+    second = sum(numbers[mid:]) / (len(numbers) - mid)
+    drift = ((second - first) / first * 100.0) if first else None
+    return {
+        "first_half_avg": round(first, 2),
+        "second_half_avg": round(second, 2),
+        "drift_pct": round(drift, 1) if drift is not None else None,
+    }
+
+
+def _summarize_streams(streams: Any) -> dict[str, Any]:
+    normalized = _normalize_streams(streams)
+    summary: dict[str, Any] = {"available_streams": sorted(normalized)}
+    samples = max((len(v) for v in normalized.values()), default=0)
+    summary["samples"] = samples
+
+    for stream_type in ("heartrate", "velocity_smooth", "watts", "cadence", "altitude"):
+        stats = _numeric_summary(normalized.get(stream_type, []))
+        if stats:
+            summary[stream_type] = stats
+            split = _half_split_summary(normalized.get(stream_type, []))
+            if split:
+                summary[stream_type]["half_split"] = split
+
+    speed_stats = summary.get("velocity_smooth")
+    if speed_stats:
+        summary["pace_sec_per_km"] = {
+            "avg": _format_pace_sec_per_km(speed_stats["avg"]),
+            "best": _format_pace_sec_per_km(speed_stats["max"]),
+        }
+    return summary
+
+
+def _summarize_intervals(intervals: Any) -> list[dict[str, Any]]:
+    if isinstance(intervals, dict):
+        intervals = (
+            intervals.get("icu_intervals")
+            or intervals.get("intervals")
+            or intervals.get("data")
+            or []
+        )
+    if not isinstance(intervals, list):
+        return []
+
+    summarized: list[dict[str, Any]] = []
+    for interval in intervals:
+        if not isinstance(interval, dict):
+            continue
+        summarized.append(
+            {
+                "id": interval.get("id"),
+                "type": interval.get("type"),
+                "start_index": interval.get("start_index"),
+                "end_index": interval.get("end_index"),
+                "duration_s": interval.get("moving_time") or interval.get("elapsed_time"),
+                "distance_m": interval.get("distance"),
+                "avg_hr": interval.get("average_heartrate"),
+                "max_hr": interval.get("max_heartrate"),
+                "avg_pace": _format_pace_sec_per_km(interval.get("average_speed")),
+                "avg_watts": interval.get("average_watts"),
+                "intensity_pct": interval.get("intensity"),
+                "training_load": interval.get("training_load"),
+                "zone": interval.get("zone"),
+            }
+        )
+    return summarized
+
+
+@tool
+def get_performance_curves(sport: str = "Run", periods: str = "42d,1y") -> dict[str, Any]:
+    """Fetch the athlete's best pace and heart-rate curves for benchmarking.
+
+    Use this to calibrate paces/thresholds and estimate race potential. `periods` is a
+    comma separated list of windows: e.g. '42d', '1y', '2y', 'all', 's0' (current season).
+    """
+    client = IntervalsIcuClient()
+    try:
+        pace = client.get_pace_curves(sport=sport, curves=periods)
+        hr = client.get_hr_curves(sport=sport, curves=periods)
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+    return {"sport": sport, "periods": periods, "pace_curves": pace, "hr_curves": hr}
+
+
+@tool
+def search_completed_activities(query: str, limit: int = 20) -> dict[str, Any]:
+    """Search completed activities by name, or exact tag when the query starts with '#'.
+
+    Useful for finding previous sessions (e.g. 'VO2max', 'long run', '#threshold').
+    """
+    client = IntervalsIcuClient()
+    try:
+        results = client.search_activities(query=query, limit=limit)
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+    return {"query": query, "count": len(results) if isinstance(results, list) else None, "activities": results}
+
+
+@tool
+def search_similar_interval_sessions(
+    min_seconds: int,
+    max_seconds: int,
+    min_intensity_pct: float,
+    max_intensity_pct: float,
+    sport: str = "Run",
+    min_reps: int | None = None,
+    max_reps: int | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Find completed activities containing intervals that match a duration/intensity band.
+
+    Intensity is a percentage of the athlete's threshold (e.g. 98-102 for threshold pace).
+    Use this to answer "when did I last run 5x1km at this pace?" or to compare blocks.
+    """
+    client = IntervalsIcuClient()
+    try:
+        results = client.search_interval_activities(
+            min_secs=min_seconds,
+            max_secs=max_seconds,
+            min_intensity=min_intensity_pct,
+            max_intensity=max_intensity_pct,
+            sport=sport,
+            min_reps=min_reps,
+            max_reps=max_reps,
+            limit=limit,
+        )
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+    return {
+        "criteria": {
+            "duration_s": [min_seconds, max_seconds],
+            "intensity_pct": [min_intensity_pct, max_intensity_pct],
+            "sport": sport,
+            "reps": [min_reps, max_reps],
+        },
+        "count": len(results) if isinstance(results, list) else None,
+        "activities": results,
+    }
+
+
+@tool
+def analyze_activity_execution(
+    activity_id: str,
+    include_streams: bool = True,
+    stream_types: str = "time,heartrate,velocity_smooth,watts,cadence",
+) -> dict[str, Any]:
+    """Review how a completed session was executed.
+
+    Returns the detected intervals/reps (duration, distance, avg pace/HR/power, intensity)
+    plus a compact stream summary (averages, bests, and first/second-half drift) so you can
+    check whether the athlete hit the prescribed targets. Pass the activity id from the
+    pre-fetched recent activities.
+    """
+    client = IntervalsIcuClient()
+    try:
+        intervals = client.get_activity_intervals(activity_id)
+        result: dict[str, Any] = {
+            "activity_id": activity_id,
+            "intervals": _summarize_intervals(intervals),
+        }
+        if include_streams:
+            streams = client.get_activity_streams(activity_id, types=stream_types)
+            result["stream_summary"] = _summarize_streams(streams)
+        return result
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+
+
+@tool
+def get_activity_interval_stats(
+    activity_id: str, start_index: int, end_index: int
+) -> dict[str, Any]:
+    """Compute interval-like stats for an arbitrary slice of an activity's streams.
+
+    Use `start_index`/`end_index` from `analyze_activity_execution` output.
+    """
+    client = IntervalsIcuClient()
+    try:
+        return client.get_interval_stats(
+            activity_id, start_index=start_index, end_index=end_index
+        )
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+
+
+@tool
+def get_activity_best_efforts(
+    activity_id: str,
+    duration_seconds: int | None = None,
+    distance_meters: float | None = None,
+    stream: str = "velocity_smooth",
+    count: int = 5,
+) -> dict[str, Any]:
+    """Find the best efforts inside a completed activity for a duration or distance."""
+    if duration_seconds is None and distance_meters is None:
+        return {"error": "Provide duration_seconds or distance_meters."}
+    client = IntervalsIcuClient()
+    try:
+        return client.get_activity_best_efforts(
+            activity_id,
+            stream=stream,
+            duration=duration_seconds,
+            distance=distance_meters,
+            count=count,
+        )
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+
+
+PERFORMANCE_ANALYSIS_TOOLS = [
+    get_performance_curves,
+    search_completed_activities,
+    search_similar_interval_sessions,
+    analyze_activity_execution,
+    get_activity_interval_stats,
+    get_activity_best_efforts,
+]

@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from hybrid_training_agent.agents import graph as graph_module
 from hybrid_training_agent.agents.graph import (
     _detect_days_back,
+    _select_analyst_tools,
     _select_planner_tools,
     build_hybrid_training_graph,
     classify_intent_pipeline,
@@ -525,6 +526,301 @@ def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     m_anth = get_chat_model(provider="opencode-go", model="qwen3.8-max")
     assert getattr(m_anth, "model", None) == "qwen3.8-max"
     assert getattr(m_anth, "anthropic_api_url", None) == "https://opencode.ai/inference/go/anthropic"
+
+
+def test_deep_analysis_and_library_tool_selection() -> None:
+    assert _select_analyst_tools("create a 60m full body strength session") == []
+    deep = {t.name for t in _select_analyst_tools(
+        "analyze how I executed my last VO2max session and my best efforts"
+    )}
+    assert {"analyze_activity_execution", "get_activity_best_efforts", "get_performance_curves"} <= deep
+
+    assert [t.name for t in _select_planner_tools("create a workout for tomorrow")] == [
+        "validate_and_preview_training_plan",
+        "upload_training_plan_to_intervals",
+    ]
+    assert "update_calendar_event" in {
+        t.name for t in _select_planner_tools("move my Thursday run to Friday")
+    }
+    library = {t.name for t in _select_planner_tools("save this workout to my library")}
+    assert {"get_workout_library", "save_workouts_to_library"} <= library
+    assert "delete_planned_event_from_intervals" in {
+        t.name for t in _select_planner_tools("delete the workout on Friday")
+    }
+
+
+def test_performance_reading_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_secret")
+    import json as jsonlib
+
+    from hybrid_training_agent.tools.analytics_tools import (
+        analyze_activity_execution,
+        get_activity_best_efforts,
+        get_performance_curves,
+        search_completed_activities,
+        search_similar_interval_sessions,
+    )
+
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        pace_route = respx_mock.get("/athlete/0/pace-curves.json").mock(
+            return_value=httpx.Response(200, json={"curves": [{"secs": 300, "value": 3.5}]})
+        )
+        hr_route = respx_mock.get("/athlete/0/hr-curves.json").mock(
+            return_value=httpx.Response(200, json={"curves": [{"secs": 300, "value": 172}]})
+        )
+        search_route = respx_mock.get("/athlete/0/activities/search").mock(
+            return_value=httpx.Response(200, json=[{"id": "i1", "name": "VO2max 5x1km"}])
+        )
+        interval_route = respx_mock.get("/athlete/0/activities/interval-search").mock(
+            return_value=httpx.Response(200, json=[{"id": "i2", "name": "Threshold 4x8m"}])
+        )
+        intervals_route = respx_mock.get("/activity/i9/intervals").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "type": "WORK",
+                        "start_index": 0,
+                        "end_index": 100,
+                        "moving_time": 300,
+                        "distance": 1000.0,
+                        "average_heartrate": 170,
+                        "max_heartrate": 178,
+                        "average_speed": 3.5,
+                        "intensity": 100,
+                        "training_load": 20,
+                        "zone": 4,
+                    }
+                ],
+            )
+        )
+        streams_route = respx_mock.get("/activity/i9/streams.json").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"type": "heartrate", "data": [150, 160, 170, 180]},
+                    {"type": "velocity_smooth", "data": [3.2, 3.3, 3.4, 3.5]},
+                ],
+            )
+        )
+        best_route = respx_mock.get("/activity/i9/best-efforts").mock(
+            return_value=httpx.Response(200, json=[{"start_index": 0, "value": 3.5}])
+        )
+
+        curves = get_performance_curves.invoke({"sport": "Run", "periods": "42d"})
+        assert pace_route.called and hr_route.called
+        assert curves["sport"] == "Run"
+
+        found = search_completed_activities.invoke({"query": "VO2max"})
+        assert search_route.called and found["count"] == 1
+
+        similar = search_similar_interval_sessions.invoke(
+            {
+                "min_seconds": 280,
+                "max_seconds": 320,
+                "min_intensity_pct": 98,
+                "max_intensity_pct": 102,
+            }
+        )
+        assert interval_route.called and similar["count"] == 1
+
+        execution = analyze_activity_execution.invoke({"activity_id": "i9"})
+        assert intervals_route.called and streams_route.called
+        assert execution["intervals"][0]["avg_hr"] == 170
+        assert execution["intervals"][0]["avg_pace"] is not None
+        assert execution["stream_summary"]["heartrate"]["avg"] == 165.0
+        assert execution["stream_summary"]["pace_sec_per_km"]["avg"] is not None
+
+        efforts = get_activity_best_efforts.invoke(
+            {"activity_id": "i9", "duration_seconds": 300}
+        )
+        assert best_route.called and efforts == [{"start_index": 0, "value": 3.5}]
+
+
+def test_workout_library_and_plan_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_secret")
+    from hybrid_training_agent.tools.planner_tools import (
+        get_athlete_training_plan,
+        get_workout_library,
+    )
+
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        respx_mock.get("/athlete/0/workouts").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "name": "5x1km VO2max",
+                        "type": "Run",
+                        "folder_id": 5,
+                        "moving_time": 2400,
+                        "icu_training_load": 60,
+                        "description": "- 1km 105% Pace",
+                    }
+                ],
+            )
+        )
+        respx_mock.get("/athlete/0/folders").mock(
+            return_value=httpx.Response(
+                200, json=[{"id": 5, "name": "Base block", "type": "PLAN", "num_workouts": 12}]
+            )
+        )
+        respx_mock.get("/athlete/0/training-plan").mock(
+            return_value=httpx.Response(200, json={"id": "tp1", "training_plan_alias": "Half"})
+        )
+
+        library = get_workout_library.invoke({})
+        assert library["workouts_count"] == 1
+        assert library["folders_count"] == 1
+        assert library["workouts"][0]["name"] == "5x1km VO2max"
+
+        plan = get_athlete_training_plan.invoke({})
+        assert plan["id"] == "tp1"
+
+
+def test_writes_require_explicit_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_secret")
+    import json as jsonlib
+
+    from hybrid_training_agent.tools.planner_tools import (
+        apply_training_plan_folder,
+        delete_planned_event_from_intervals,
+        save_workouts_to_library,
+        update_calendar_event,
+        upload_training_plan_to_intervals,
+    )
+
+    run_workout = {
+        "date": "2026-10-20",
+        "name": "Easy Run",
+        "sport_type": "Run",
+        "description": "- 30m 70% Pace",
+    }
+
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        bulk = respx_mock.post("/athlete/0/events/bulk").mock(
+            return_value=httpx.Response(200, json=[{"id": 1}])
+        )
+        get_event = respx_mock.get("/athlete/0/events/123").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": 123,
+                    "name": "Old workout",
+                    "start_date_local": "2026-10-20T00:00:00",
+                    "category": "WORKOUT",
+                    "type": "Run",
+                    "description": "old",
+                },
+            )
+        )
+        delete_event = respx_mock.delete("/athlete/0/events/123").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        put_event = respx_mock.put("/athlete/0/events/123").mock(
+            return_value=httpx.Response(200, json={"id": 123, "name": "New name"})
+        )
+        create_workout = respx_mock.post("/athlete/0/workouts").mock(
+            return_value=httpx.Response(200, json={"id": 7})
+        )
+        apply_plan = respx_mock.post("/athlete/0/events/apply-plan").mock(
+            return_value=httpx.Response(200, json={"applied": 12})
+        )
+
+        # 1. Upload
+        preview = upload_training_plan_to_intervals.invoke({"workouts": [run_workout]})
+        assert preview["status"] == "confirmation_required"
+        assert not bulk.called
+        uploaded = upload_training_plan_to_intervals.invoke(
+            {"workouts": [run_workout], "confirm": True}
+        )
+        assert bulk.called and uploaded["status"] == "uploaded"
+
+        # 2. Delete
+        preview = delete_planned_event_from_intervals.invoke({"event_id": "123"})
+        assert preview["status"] == "confirmation_required"
+        assert preview["details"]["event"]["name"] == "Old workout"
+        assert not delete_event.called
+        deleted = delete_planned_event_from_intervals.invoke(
+            {"event_id": "123", "confirm": True}
+        )
+        assert delete_event.called and deleted["status"] == "deleted"
+
+        # 3. Update event
+        preview = update_calendar_event.invoke({"event_id": "123", "updates": {"name": "New name"}})
+        assert preview["status"] == "confirmation_required"
+        assert preview["details"]["changes"]["name"] == {"from": "Old workout", "to": "New name"}
+        assert not put_event.called
+        updated = update_calendar_event.invoke(
+            {"event_id": "123", "updates": {"name": "New name"}, "confirm": True}
+        )
+        assert put_event.called and updated["status"] == "updated"
+        # Unsupported fields are rejected outright.
+        rejected = update_calendar_event.invoke(
+            {"event_id": "123", "updates": {"push_errors": []}, "confirm": True}
+        )
+        assert rejected["status"] == "failed"
+
+        # 4. Save to library
+        preview = save_workouts_to_library.invoke(
+            {"workouts": [{"name": "Library Run", "sport_type": "Run", "description": "- 20m 70% Pace"}], "folder_id": 5}
+        )
+        assert preview["status"] == "confirmation_required"
+        assert not create_workout.called
+        saved = save_workouts_to_library.invoke(
+            {
+                "workouts": [
+                    {"name": "Library Run", "sport_type": "Run", "description": "- 20m 70% Pace"}
+                ],
+                "folder_id": 5,
+                "confirm": True,
+            }
+        )
+        assert create_workout.called and saved["status"] == "saved"
+        body = jsonlib.loads(create_workout.calls[0].request.content)
+        assert body["folder_id"] == 5 and body["type"] == "Run"
+
+        # 5. Apply plan folder
+        preview = apply_training_plan_folder.invoke(
+            {"folder_id": 9, "start_date_local": "2026-11-02"}
+        )
+        assert preview["status"] == "confirmation_required"
+        assert not apply_plan.called
+        applied = apply_training_plan_folder.invoke(
+            {"folder_id": 9, "start_date_local": "2026-11-02", "confirm": True}
+        )
+        assert apply_plan.called and applied["status"] == "applied"
+
+
+def test_planner_prompt_requires_confirmation_gate() -> None:
+    from hybrid_training_agent.agents.prompts import PLANNER_SYSTEM_PROMPT
+
+    lower = PLANNER_SYSTEM_PROMPT.lower()
+    assert "confirmation gate" in lower
+    assert "confirm=true" in lower
+    assert "confirm=false" in lower
+    for tool_name in (
+        "upload_training_plan_to_intervals",
+        "delete_planned_event_from_intervals",
+        "update_calendar_event",
+        "save_workouts_to_library",
+        "apply_training_plan_folder",
+    ):
+        assert tool_name in PLANNER_SYSTEM_PROMPT
+
+
+def test_analyst_prompt_lists_read_only_analysis_tools() -> None:
+    from hybrid_training_agent.agents.prompts import ANALYST_SYSTEM_PROMPT
+
+    for tool_name in (
+        "get_performance_curves",
+        "analyze_activity_execution",
+        "search_similar_interval_sessions",
+        "get_activity_best_efforts",
+    ):
+        assert tool_name in ANALYST_SYSTEM_PROMPT
 
 
 def test_extract_message_text_from_content_blocks() -> None:

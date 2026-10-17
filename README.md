@@ -24,19 +24,41 @@
 │ • HRV (7d RMSSD/CV%)  │  │   Meta-Analyses      │  │   syntax for Suunto     │
 │ • Strength & Run      │  │ • Verifiable PMID &  │  │ • Strength: calendar    │
 │   Spacing Audit       │  │   DOI Citations      │  │   note in intervals.icu │
+│ • Pace/HR curves, PBs │  │                      │  │ • Workout library,      │
+│ • Session execution   │  │                      │  │   plans, event edits    │
 └───────────────────────┘  └──────────────────────┘  └─────────────────────────┘
 ```
+
+### Performance Analysis (Analyst, read-only)
+Beyond the pre-fetched load/wellness snapshot, the analyst can drill into the athlete's data when the request is analysis-style (`analyze`, `compare`, `how did`, `PB`, `when did I last`, …):
+- **`get_performance_curves`** — best pace/HR curves (`42d`, `1y`, `all`, season) for threshold calibration and race potential.
+- **`analyze_activity_execution`** — detected intervals/reps (duration, distance, avg pace/HR/power, intensity) plus a compact stream summary (averages, bests, first/second-half drift).
+- **`search_similar_interval_sessions`** / **`search_completed_activities`** — find comparable past sessions ("when did I last run 5×1km at this pace?").
+- **`get_activity_interval_stats`** / **`get_activity_best_efforts`** — arbitrary-slice stats and best efforts (duration or distance).
+
+### Workout Library, Plans & Calendar Edits (Planner)
+- **`get_workout_library`** / **`get_athlete_training_plan`** — inspect saved workouts, folders/plans and the applied plan.
+- **`save_workouts_to_library`** — save reusable workouts (optionally into a folder/plan).
+- **`apply_training_plan_folder`** — schedule a saved plan folder onto the calendar from a start date.
+- **`update_calendar_event`** — move, reschedule, rename or edit a single calendar event.
 
 ### How Workouts Are Planned & Synced
 - **Running Workouts (`Run`):** Written in **Intervals.icu Workout Builder syntax** (`- 15m 65-75% Pace`, `5x`, etc.) so `intervals.icu` automatically syncs structured intervals to your **Suunto** watch.
 - **Strength Workouts (`WeightTraining`):** Uploaded as readable **calendar notes** in `intervals.icu` (exercises, sets, reps, rest). Because they are notes rather than Suunto guide workouts, `intervals.icu` never attempts a watch push for them — this avoids the `Suunto upload failed` flag that a step-less strength "workout" triggers.
+
+### Confirmation Gate (writes & deletes)
+Every mutating tool defaults to `confirm=false` and returns a `confirmation_required` preview instead of acting:
+`upload_training_plan_to_intervals`, `delete_planned_event_from_intervals`, `update_calendar_event`, `save_workouts_to_library`, `apply_training_plan_folder`.
+
+The planner must show that preview to you and ask for explicit confirmation, then re-call the tool with `confirm=true` only after you agree. The planner is instructed never to set `confirm=true` on its own. In `ask`, the built-in follow-up prompt lets you answer the confirmation; in `chat` you simply reply on the next turn. The same gate applies to the MCP server tools.
 
 ### Latency Optimizations
 `ask` and `chat` are tuned to minimize network trips and model round trips:
 - **Deterministic pre-fetch:** the analyst's profile + training/wellness analysis, the researcher's curated evidence, and the planner's upcoming calendar are fetched up front and injected into the sub-agent context, so an agent answers in one model call instead of spending a turn choosing tools. The analyst honors an explicit window (e.g. `last 60 days`).
 - **Concurrent I/O:** independent tool calls (and pre-fetches) run in a thread pool instead of sequentially.
 - **Connection reuse + read cache:** one pooled `httpx` client serves both intervals.icu and PubMed, and read responses are cached in-process for `KINESIS_CACHE_TTL_SECONDS` (default `60`, `0` disables). Any write (upload/delete) invalidates cached reads.
-- **Lean tool payloads:** the planner binds only `validate_and_preview_training_plan` and `upload_training_plan_to_intervals` (plus the delete tool for removal requests); the literature sub-agent runs only when evidence is requested.
+- **Lean tool payloads:** the planner normally binds only `validate_and_preview_training_plan` + `upload_training_plan_to_intervals`, adding delete/update/library tools solely when the request mentions them; the analyst's benchmarking tools are bound only for analysis-style requests; the literature sub-agent runs only when evidence is requested.
+
 
 
 ---
@@ -88,7 +110,7 @@ uv run kinesis evidence --query "concurrent training running economy heavy resis
 ## Using as an MCP Server & OpenCode Skill
 
 ### MCP Server
-You can expose all 8 tools (`intervals.icu` analytics, PubMed search, and workout plan validator/uploader) as a standard Model Context Protocol (MCP) server:
+You can expose **20 tools** (intervals.icu analytics, performance benchmarking, activity execution analysis, workout library/plans, plan validator/uploader, and PubMed search) as a standard Model Context Protocol (MCP) server. Mutating tools (`upload`, `delete`, `update event`, `save to library`, `apply plan`) keep the same confirmation gate: call with `confirm=false` for a preview, then `confirm=true` after the user agrees.
 ```powershell
 uv run kinesis mcp
 ```

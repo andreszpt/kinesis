@@ -121,6 +121,47 @@ def get_upcoming_intervals_calendar(days_ahead: int = 14) -> dict[str, Any]:
         return {"error": str(exc), "events": []}
 
 
+def _confirmation_required(
+    action: str,
+    summary: str,
+    details: dict[str, Any],
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    """Standard payload returned by mutating tools until the user confirms."""
+    return {
+        "status": "confirmation_required",
+        "action": action,
+        "summary": summary,
+        "details": details,
+        "instruction": instruction
+        or (
+            "Show this preview to the user and ask for explicit confirmation. "
+            "Only call this tool again with confirm=true after the user clearly agrees."
+        ),
+    }
+
+
+# Event fields the agent is allowed to change on the intervals.icu calendar.
+UPDATABLE_EVENT_FIELDS = {
+    "name",
+    "description",
+    "start_date_local",
+    "end_date_local",
+    "category",
+    "type",
+    "moving_time",
+    "icu_training_load",
+    "color",
+    "show_as_note",
+    "not_on_fitness_chart",
+    "distance",
+    "target",
+    "tags",
+    "indoor",
+    "carbs_per_hour",
+}
+
+
 @tool
 def validate_and_preview_training_plan(
     workouts: list[dict[str, Any]],
@@ -153,6 +194,7 @@ def validate_and_preview_training_plan(
 def upload_training_plan_to_intervals(
     workouts: list[dict[str, Any]],
     upsert: bool = True,
+    confirm: bool = False,
 ) -> dict[str, Any]:
     """Upload a list of planned Running and Strength workouts (or Notes) to intervals.icu calendar.
 
@@ -160,9 +202,26 @@ def upload_training_plan_to_intervals(
     Running workouts formatted with intervals.icu step syntax (`- 10m 70-78% Pace`) will automatically sync to Suunto,
     while WeightTraining workouts are uploaded as readable calendar notes so intervals.icu never attempts a Suunto
     guide push for them (which would fail for a step-less strength workout).
+
+    SAFETY: call first with `confirm=false` (default) to get a preview. You MUST show that preview to the user and
+    ask for explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
     """
     parsed = [PlannedWorkoutInput(**w) for w in workouts]
     audit = audit_planned_workouts(parsed)
+    payloads = [IntervalsIcuClient.build_event_payload(w) for w in parsed]
+
+    if not confirm:
+        return _confirmation_required(
+            "upload_training_plan_to_intervals",
+            f"Upload/update {len(parsed)} workout(s) on the intervals.icu calendar (upsert={upsert}).",
+            {
+                "upsert": upsert,
+                "workouts": [w.model_dump() for w in parsed],
+                "intervals_event_payloads_preview": payloads,
+                "audit": audit,
+            },
+        )
+
     client = IntervalsIcuClient()
     try:
         created = client.create_events_bulk(parsed, upsert=upsert)
@@ -181,9 +240,30 @@ def upload_training_plan_to_intervals(
 
 
 @tool
-def delete_planned_event_from_intervals(event_id: str) -> dict[str, Any]:
-    """Delete a planned workout or note from the athlete's intervals.icu calendar by event ID."""
+def delete_planned_event_from_intervals(
+    event_id: str, confirm: bool = False
+) -> dict[str, Any]:
+    """Delete a planned workout or note from the athlete's intervals.icu calendar by event ID.
+
+    SAFETY: call first with `confirm=false` (default) to get a preview of the event. You MUST show it to the user
+    and ask for explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
+    """
     client = IntervalsIcuClient()
+    if not confirm:
+        try:
+            event = client.get_event(event_id)
+        except IntervalsIcuError as exc:
+            return {"status": "failed", "event_id": event_id, "error": str(exc)}
+        preview = {
+            key: event.get(key)
+            for key in ("id", "name", "start_date_local", "category", "type", "description")
+        }
+        return _confirmation_required(
+            "delete_planned_event_from_intervals",
+            f"Delete calendar event {event_id} ('{event.get('name')}' on {event.get('start_date_local')}).",
+            {"event": preview},
+        )
+
     try:
         client.delete_event(event_id)
         return {"status": "deleted", "event_id": event_id}
@@ -191,9 +271,192 @@ def delete_planned_event_from_intervals(event_id: str) -> dict[str, Any]:
         return {"status": "failed", "event_id": event_id, "error": str(exc)}
 
 
+@tool
+def update_calendar_event(
+    event_id: str, updates: dict[str, Any], confirm: bool = False
+) -> dict[str, Any]:
+    """Update a single planned workout/note on the intervals.icu calendar (move, rename, edit, change load).
+
+    SAFETY: call first with `confirm=false` (default) to get a before/after preview. You MUST show it to the user
+    and ask for explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
+    """
+    invalid = sorted(set(updates) - UPDATABLE_EVENT_FIELDS)
+    if invalid:
+        return {
+            "status": "failed",
+            "error": f"Unsupported event fields: {', '.join(invalid)}",
+            "allowed_fields": sorted(UPDATABLE_EVENT_FIELDS),
+        }
+
+    client = IntervalsIcuClient()
+    try:
+        current = client.get_event(event_id)
+    except IntervalsIcuError as exc:
+        return {"status": "failed", "event_id": event_id, "error": str(exc)}
+
+    if not confirm:
+        changes = {
+            key: {"from": current.get(key), "to": value}
+            for key, value in updates.items()
+        }
+        return _confirmation_required(
+            "update_calendar_event",
+            f"Update calendar event {event_id} ('{current.get('name')}'): {', '.join(sorted(updates))}.",
+            {"event_id": event_id, "changes": changes},
+        )
+
+    try:
+        updated = client.update_event(event_id, updates)
+        return {"status": "updated", "event_id": event_id, "event": updated}
+    except IntervalsIcuError as exc:
+        return {"status": "failed", "event_id": event_id, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Workout library & plans
+# ---------------------------------------------------------------------------
+@tool
+def get_workout_library() -> dict[str, Any]:
+    """List the athlete's saved workouts, folders and plans from the intervals.icu library.
+
+    Use this before saving a new workout (to avoid duplicates) or to find a plan folder to apply.
+    """
+    client = IntervalsIcuClient()
+    try:
+        workouts = client.get_workouts()
+        folders = client.get_folders()
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+
+    workout_summaries = [
+        {
+            key: w.get(key)
+            for key in ("id", "name", "type", "folder_id", "moving_time", "icu_training_load", "description")
+        }
+        for w in workouts
+    ]
+    folder_summaries = [
+        {
+            key: f.get(key)
+            for key in ("id", "name", "type", "description", "num_workouts", "duration_weeks")
+        }
+        for f in folders
+    ]
+    return {
+        "workouts_count": len(workout_summaries),
+        "folders_count": len(folder_summaries),
+        "workouts": workout_summaries,
+        "folders": folder_summaries,
+    }
+
+
+@tool
+def get_athlete_training_plan() -> dict[str, Any]:
+    """Get the athlete's currently applied intervals.icu training plan."""
+    client = IntervalsIcuClient()
+    try:
+        return client.get_training_plan()
+    except IntervalsIcuError as exc:
+        return {"error": str(exc)}
+
+
+@tool
+def save_workouts_to_library(
+    workouts: list[dict[str, Any]],
+    folder_id: int | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Save workouts into the athlete's intervals.icu library, optionally inside a folder/plan.
+
+    Each workout accepts: name, sport_type (Run/WeightTraining), description, moving_time_minutes,
+    estimated_load, day (0-based day inside a plan folder), folder_id (per-workout override).
+
+    SAFETY: call first with `confirm=false` (default) to get a preview. You MUST show it to the user and ask for
+    explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
+    """
+    payloads: list[dict[str, Any]] = []
+    for workout in workouts:
+        sport = str(workout.get("sport_type") or workout.get("type") or "Run")
+        target_folder = workout.get("folder_id", folder_id)
+        payload: dict[str, Any] = {
+            "name": workout.get("name") or "Untitled workout",
+            "type": sport,
+            "description": workout.get("description") or "",
+        }
+        if target_folder is not None:
+            payload["folder_id"] = int(target_folder)
+        if workout.get("moving_time_minutes") is not None:
+            payload["moving_time"] = int(float(workout["moving_time_minutes"]) * 60)
+        if workout.get("estimated_load") is not None:
+            payload["icu_training_load"] = int(workout["estimated_load"])
+        if workout.get("day") is not None:
+            payload["day"] = int(workout["day"])
+        payloads.append(payload)
+
+    if not confirm:
+        return _confirmation_required(
+            "save_workouts_to_library",
+            f"Save {len(payloads)} workout(s) to the intervals.icu library"
+            + (f" (folder {folder_id})." if folder_id is not None else "."),
+            {"workouts": payloads},
+        )
+
+    client = IntervalsIcuClient()
+    created: list[dict[str, Any]] = []
+    try:
+        for payload in payloads:
+            created.append(client.create_workout(payload))
+        return {"status": "saved", "saved_count": len(created), "workouts": created}
+    except IntervalsIcuError as exc:
+        return {"status": "failed", "error": str(exc), "saved": created}
+
+
+@tool
+def apply_training_plan_folder(
+    folder_id: int, start_date_local: str, confirm: bool = False
+) -> dict[str, Any]:
+    """Apply a workout folder/plan from the library to the athlete's calendar starting on a date.
+
+    SAFETY: call first with `confirm=false` (default) to get a preview. You MUST show it to the user and ask for
+    explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
+    """
+    if not confirm:
+        return _confirmation_required(
+            "apply_training_plan_folder",
+            f"Apply plan folder {folder_id} to the calendar starting {start_date_local}.",
+            {"folder_id": int(folder_id), "start_date_local": start_date_local},
+        )
+
+    client = IntervalsIcuClient()
+    try:
+        result = client.apply_plan(int(folder_id), start_date_local)
+        return {
+            "status": "applied",
+            "folder_id": int(folder_id),
+            "start_date_local": start_date_local,
+            "result": result,
+        }
+    except IntervalsIcuError as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+PLANNER_CORE_TOOLS = [
+    validate_and_preview_training_plan,
+    upload_training_plan_to_intervals,
+]
+
+PLANNER_LIBRARY_TOOLS = [
+    get_workout_library,
+    get_athlete_training_plan,
+    save_workouts_to_library,
+    apply_training_plan_folder,
+]
+
 PLANNER_TOOLS = [
     get_upcoming_intervals_calendar,
     validate_and_preview_training_plan,
     upload_training_plan_to_intervals,
     delete_planned_event_from_intervals,
+    update_calendar_event,
+    *PLANNER_LIBRARY_TOOLS,
 ]
