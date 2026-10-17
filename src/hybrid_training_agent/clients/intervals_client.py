@@ -236,7 +236,11 @@ class IntervalsIcuClient:
             # Validate ISO format
             datetime.fromisoformat(dt_str)
 
-        if workout.sport_type == "Note":
+        # 'Note' events are calendar notes. Strength sessions are uploaded as notes too:
+        # intervals.icu only builds SuuntoPlus Guides for WORKOUT events, and Suunto rejects
+        # a guide with no steps. Strength sessions are plain readable text (no step lines),
+        # so pushing them as workouts fails with "Suunto upload failed" every time.
+        if workout.sport_type in ("Note", "WeightTraining"):
             payload: dict[str, Any] = {
                 "category": "NOTE",
                 "start_date_local": dt_str,

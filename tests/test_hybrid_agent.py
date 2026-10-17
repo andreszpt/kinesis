@@ -204,6 +204,60 @@ def test_audit_planned_workouts_and_bulk_upload() -> None:
         assert post_route.called
         assert len(uploaded) == 2
 
+        import json
+
+        sent = json.loads(post_route.calls[0].request.content)
+        # Strength sessions are uploaded as calendar notes so intervals.icu never attempts a
+        # Suunto guide push (which fails for a step-less strength workout).
+        assert sent[0]["category"] == "NOTE"
+        assert "type" not in sent[0]
+        assert "icu_training_load" not in sent[0]
+        assert sent[0]["description"] == "Back Squat 4x5, RDL 3x6, Calf Raises 3x10"
+        # Running workouts remain structured WORKOUT events with a load for Suunto sync.
+        assert sent[1]["category"] == "WORKOUT"
+        assert sent[1]["type"] == "Run"
+        assert sent[1]["icu_training_load"] == 72
+
+
+def test_strength_events_are_uploaded_as_notes() -> None:
+    strength = PlannedWorkoutInput(
+        date="2026-10-18",
+        name="Full-Body Strength",
+        sport_type="WeightTraining",
+        description="Squat 3x5",
+        moving_time_minutes=60,
+        estimated_load=35,
+    )
+    payload = IntervalsIcuClient.build_event_payload(strength)
+
+    assert payload["category"] == "NOTE"
+    assert "type" not in payload
+    assert "icu_training_load" not in payload
+    assert "moving_time" not in payload
+    assert payload["start_date_local"] == "2026-10-18T00:00:00"
+    assert payload["description"] == "Squat 3x5"
+    assert payload["external_id"].startswith("kinesis-2026-10-18-weighttraining-")
+
+    run = PlannedWorkoutInput(
+        date="2026-10-19",
+        name="Easy Run",
+        sport_type="Run",
+        description="- 30m 70% Pace",
+        moving_time_minutes=30,
+        estimated_load=30,
+    )
+    run_payload = IntervalsIcuClient.build_event_payload(run)
+    assert run_payload["category"] == "WORKOUT"
+    assert run_payload["type"] == "Run"
+    assert run_payload["icu_training_load"] == 30
+
+    note_payload = IntervalsIcuClient.build_event_payload(
+        PlannedWorkoutInput(
+            date="2026-10-20", name="Travel day", sport_type="Note", description="Rest"
+        )
+    )
+    assert note_payload["category"] == "NOTE"
+
 
 def test_langgraph_multi_agent_pipeline_execution() -> None:
     # Routine plan requests skip the literature sub-agent by default.

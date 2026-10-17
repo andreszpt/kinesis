@@ -36,7 +36,7 @@ class PlannedWorkoutInput(BaseModel):
     name: str = Field(..., description="Short, descriptive workout title")
     sport_type: Literal["Run", "WeightTraining", "Note"] = Field(
         ...,
-        description="'Run' for running workouts (synced to Suunto), 'WeightTraining' for strength workouts written in intervals.icu, or 'Note' for calendar notes",
+        description="'Run' for running workouts (synced to Suunto), 'WeightTraining' for strength workouts uploaded as readable calendar notes in intervals.icu (never pushed to Suunto as a guide), or 'Note' for calendar notes",
     )
     description: str = Field(
         ...,

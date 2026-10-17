@@ -37,5 +37,5 @@ Always provide verifiable peer-reviewed citations (**Authors, Year, Journal, PMI
   - 2m 60-70% Pace
   ```
   Add `- 15m 65-75% Pace` style warm-up/cool-down steps only when explicitly requested.
-- **Strength Workouts (`WeightTraining`) — Written in Intervals.icu**:
-  Write the workout directly in `intervals.icu` event `description` as clean, readable text (exercises, sets, reps, rest). No special watch sync or post-session logging is required, and no warm-up/cool-down sections unless explicitly requested.
+- **Strength Workouts (`WeightTraining`) — Uploaded as a Calendar Note**:
+  Write the workout directly in the `intervals.icu` event `description` as clean, readable text (exercises, sets, reps, rest). Strength sessions are uploaded as calendar notes, never as Suunto guide workouts, so no watch push is attempted. No post-session logging is required, and no warm-up/cool-down sections unless explicitly requested.

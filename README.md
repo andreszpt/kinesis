@@ -22,14 +22,14 @@
 │ • CTL / ATL / TSB     │  │ • Europe PMC REST    │  │   Researcher findings   │
 │ • ACWR & Polarization │  │ • Curated Hybrid     │  │ • Running: structured   │
 │ • HRV (7d RMSSD/CV%)  │  │   Meta-Analyses      │  │   syntax for Suunto     │
-│ • Strength & Run      │  │ • Verifiable PMID &  │  │ • Strength: written     │
-│   Spacing Audit       │  │   DOI Citations      │  │   in intervals.icu      │
+│ • Strength & Run      │  │ • Verifiable PMID &  │  │ • Strength: calendar    │
+│   Spacing Audit       │  │   DOI Citations      │  │   note in intervals.icu │
 └───────────────────────┘  └──────────────────────┘  └─────────────────────────┘
 ```
 
 ### How Workouts Are Planned & Synced
 - **Running Workouts (`Run`):** Written in **Intervals.icu Workout Builder syntax** (`- 15m 65-75% Pace`, `5x`, etc.) so `intervals.icu` automatically syncs structured intervals to your **Suunto** watch.
-- **Strength Workouts (`WeightTraining`):** Written directly as readable workout descriptions on your **intervals.icu** calendar (exercises, sets, reps, rest)—no Suunto watch sync or special manual logging needed.
+- **Strength Workouts (`WeightTraining`):** Uploaded as readable **calendar notes** in `intervals.icu` (exercises, sets, reps, rest). Because they are notes rather than Suunto guide workouts, `intervals.icu` never attempts a watch push for them — this avoids the `Suunto upload failed` flag that a step-less strength "workout" triggers.
 
 ### Latency Optimizations
 `ask` and `chat` are tuned to minimize network trips and model round trips:

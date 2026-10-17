@@ -129,7 +129,7 @@ def validate_and_preview_training_plan(
 
     Checks:
     1. Every 'Run' workout uses valid intervals.icu step syntax (e.g. `- 10m 65-75% Pace`) so it syncs as a structured workout to Suunto.
-    2. Every 'WeightTraining' workout is formatted as a readable text workout for intervals.icu (does not need Suunto step syntax).
+    2. Every 'WeightTraining' workout is formatted as a readable text workout and uploaded as an intervals.icu calendar note (no Suunto step syntax, no watch guide push).
     3. Audits concurrent training spacing (6-24h rule between heavy lower-body lifting and quality/long runs).
 
     Each item in `workouts` must have:
@@ -158,7 +158,8 @@ def upload_training_plan_to_intervals(
 
     Uses `POST /api/v1/athlete/{id}/events/bulk` with `upsert=true` so re-uploading updates existing events cleanly.
     Running workouts formatted with intervals.icu step syntax (`- 10m 70-78% Pace`) will automatically sync to Suunto,
-    while WeightTraining workouts are written directly onto the intervals.icu calendar.
+    while WeightTraining workouts are uploaded as readable calendar notes so intervals.icu never attempts a Suunto
+    guide push for them (which would fail for a step-less strength workout).
     """
     parsed = [PlannedWorkoutInput(**w) for w in workouts]
     audit = audit_planned_workouts(parsed)
