@@ -184,11 +184,15 @@ def test_audit_planned_workouts_and_bulk_upload() -> None:
 
 
 def test_langgraph_multi_agent_pipeline_execution() -> None:
+    # Routine plan requests skip the literature sub-agent by default.
     assert classify_intent_pipeline("Build me a 7-day hybrid running and strength plan") == [
         "analyst",
-        "researcher",
         "planner",
     ]
+    # ...but an explicit ask for evidence/citations brings the researcher back in.
+    assert classify_intent_pipeline(
+        "Build me a 7-day hybrid running and strength plan backed by scientific evidence"
+    ) == ["analyst", "researcher", "planner"]
     assert classify_intent_pipeline("What does PubMed say about the interference effect?") == [
         "researcher"
     ]
@@ -218,7 +222,12 @@ def test_langgraph_multi_agent_pipeline_execution() -> None:
     state_out: dict[str, Any] = graph.invoke(
         {
             "messages": [
-                HumanMessage(content="Create a comprehensive weekly hybrid training plan for me")
+                HumanMessage(
+                    content=(
+                        "Create a comprehensive weekly hybrid training plan for me, "
+                        "backed by peer-reviewed evidence"
+                    )
+                )
             ],
             "next_agent": "supervisor",
             "visited_agents": [],
@@ -232,6 +241,36 @@ def test_langgraph_multi_agent_pipeline_execution() -> None:
     assert ai_messages[0].name == "Performance_and_Health_Analyst"
     assert ai_messages[1].name == "Sports_Science_Researcher"
     assert ai_messages[2].name == "Hybrid_Coach_Planner"
+
+
+def test_default_plan_skips_researcher_subagent() -> None:
+    fake_llm = _RecordingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Analyst Report: CTL 54."),
+                AIMessage(content="Coach Plan: 60m full body strength session."),
+            ]
+        )
+    )
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    state_out: dict[str, Any] = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content="Create a 60m full body strength training for tomorrow")
+            ],
+            "next_agent": "supervisor",
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+
+    assert state_out["visited_agents"] == ["analyst", "planner"]
+    ai_messages = [m for m in state_out["messages"] if isinstance(m, AIMessage)]
+    assert [m.name for m in ai_messages] == [
+        "Performance_and_Health_Analyst",
+        "Hybrid_Coach_Planner",
+    ]
+    assert isinstance(state_out["messages"][-1].content, str)
 
 
 def test_subagent_requests_never_replay_foreign_thinking_blocks() -> None:
@@ -265,7 +304,11 @@ def test_subagent_requests_never_replay_foreign_thinking_blocks() -> None:
     graph = build_hybrid_training_graph(llm=fake_llm)
     graph.invoke(
         {
-            "messages": [HumanMessage(content="Create a comprehensive hybrid training plan")],
+            "messages": [
+                HumanMessage(
+                    content="Create a comprehensive hybrid training plan with scientific citations"
+                )
+            ],
             "next_agent": "supervisor",
             "visited_agents": [],
             "mode": "plan",

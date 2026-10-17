@@ -55,6 +55,10 @@ uv run kinesis status
 uv run kinesis chat
 
 # 3. Ask a one-shot question or request a full training plan
+# Plans are practical by default (analyst data check + planner). Add wording like
+# "backed by scientific evidence" or "with citations" to run the literature sub-agent
+# and get a PMID/DOI-backed rationale section.
+uv run kinesis ask "Create a 60m full body strength training for tomorrow"
 uv run kinesis ask "Analyze my last 28 days on intervals.icu and build a 7-day hybrid running + strength plan backed by scientific evidence"
 
 # If the agents end their turn with a clarifying question (e.g. equipment, weekly

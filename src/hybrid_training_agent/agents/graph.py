@@ -172,16 +172,18 @@ def _run_tool_calling_subagent(
 
 
 def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
-    """Determine the optimal ordered sequence of specialist sub-agents for a user request."""
+    """Determine the optimal ordered sequence of specialist sub-agents for a user request.
+
+    The literature sub-agent is only added when the user explicitly asks for scientific
+    evidence/citations, so routine plan requests stay fast and free of citation dumps.
+    """
     if mode == "research":
         return ["researcher"]
     if mode == "analyze":
         return ["analyst"]
-    if mode == "plan":
-        return ["analyst", "researcher", "planner"]
 
     lower = user_text.lower()
-    wants_plan = any(
+    wants_plan = mode == "plan" or any(
         kw in lower
         for kw in (
             "plan",
@@ -196,16 +198,23 @@ def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
             "prescribe",
         )
     )
-    wants_science = any(
+    wants_evidence = any(
         kw in lower
         for kw in (
             "science",
             "scientific",
             "evidence",
+            "citation",
+            "citations",
+            "cite",
+            "literature",
+            "peer-reviewed",
             "study",
             "studies",
             "paper",
             "pubmed",
+            "pmid",
+            "doi",
             "meta-analysis",
             "interference",
             "hypertrophy",
@@ -238,16 +247,23 @@ def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
     )
 
     if wants_plan:
-        # Comprehensive planning always inspects data + gathers scientific evidence + builds plan
-        return ["analyst", "researcher", "planner"]
-    if wants_analysis and wants_science:
+        # Planning always inspects the athlete's data, but the literature sub-agent is
+        # only added when the user explicitly asks for scientific evidence/citations.
+        pipeline = ["analyst"]
+        if wants_evidence:
+            pipeline.append("researcher")
+        pipeline.append("planner")
+        return pipeline
+
+    if wants_analysis and wants_evidence:
         return ["analyst", "researcher"]
-    if wants_science:
+    if wants_evidence:
         return ["researcher"]
     if wants_analysis:
         return ["analyst"]
 
-    return ["analyst", "researcher", "planner"]
+    # No explicit keywords: inspect the data, then produce the answer.
+    return ["analyst", "planner"]
 
 
 def build_hybrid_training_graph(llm: BaseChatModel | None = None):
