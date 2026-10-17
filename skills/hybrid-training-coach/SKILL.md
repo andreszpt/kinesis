@@ -28,18 +28,14 @@ Always provide verifiable peer-reviewed citations (**Authors, Year, Journal, PMI
 
 ## 2. Intervals.icu Workout Formatting
 
+- **Warm-up & cool-down are opt-in**: Do NOT add warm-up or cool-down steps by default — only include them when the athlete explicitly asks for a warm-up and/or cool-down. The main work set is the default for both running and strength.
 - **Running Workouts (`Run`) — Synced to Suunto**:
   Format `description` using `intervals.icu` step lines starting with `- ` so `intervals.icu` compiles the workout and syncs it to the athlete's Suunto watch:
   ```text
-  Warmup
-  - 15m 65-75% Pace
-
   Main Set 5x
   - 1km 98-102% Pace
   - 2m 60-70% Pace
-
-  Cooldown
-  - 10m 65-75% Pace
   ```
+  Add `- 15m 65-75% Pace` style warm-up/cool-down steps only when explicitly requested.
 - **Strength Workouts (`WeightTraining`) — Written in Intervals.icu**:
-  Write the workout directly in `intervals.icu` event `description` as clean, readable text (exercises, sets, reps, rest). No special watch sync or post-session logging is required.
+  Write the workout directly in `intervals.icu` event `description` as clean, readable text (exercises, sets, reps, rest). No special watch sync or post-session logging is required, and no warm-up/cool-down sections unless explicitly requested.

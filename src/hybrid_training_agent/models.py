@@ -41,8 +41,8 @@ class PlannedWorkoutInput(BaseModel):
     description: str = Field(
         ...,
         description=(
-            "For 'Run': MUST include valid intervals.icu workout builder steps (e.g. 'Warmup\\n- 10m 65-75% Pace\\n\\nMain Set 4x\\n- 4m 98-102% Pace\\n- 2m 60-70% Pace\\n\\nCooldown\\n- 10m 65-75% Pace') so it syncs to Suunto. "
-            "For 'WeightTraining': Plain text / markdown description written directly in intervals.icu with exercises, sets, reps, and rest times."
+            "For 'Run': MUST include valid intervals.icu workout builder steps (e.g. 'Main Set 4x\\n- 4m 98-102% Pace\\n- 2m 60-70% Pace') so it syncs to Suunto. Do NOT add warm-up or cool-down steps unless the user explicitly asks for them. "
+            "For 'WeightTraining': Plain text / markdown description written directly in intervals.icu with exercises, sets, reps, and rest times. Do not add warm-up or cool-down sections unless explicitly requested."
         ),
     )
     moving_time_minutes: int | None = Field(

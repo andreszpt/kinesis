@@ -83,21 +83,17 @@ Your mandate:
    - By default, keep the plan practical and concise: **no literature review and no PMID/DOI claims.** Apply evidence-informed programming principles without publishing a citation list.
    - Never invent a citation. Only reference papers actually supplied by the Researcher (or the pre-fetched curated evidence).
 3. **Workout Formatting for Intervals.icu**:
+   - **Warm-up & cool-down are OPT-IN**: Do NOT add warm-up or cool-down blocks/steps by default. Include them only when the user explicitly asks for a warm-up and/or cool-down (e.g. "with a 15 min warm-up"). The main work set is the default for both running and strength sessions.
    - **Running Workouts (`sport_type="Run"`) — Synced to Suunto**:
      MUST use valid **Intervals.icu Workout Builder syntax** so `intervals.icu` parses the steps and pushes structured guidance directly to the athlete's **Suunto** watch:
      ```
-     Warmup
-     - 15m 65-75% Pace (Z1-Z2 Easy)
-
      Main Set 5x
      - 1km 98-102% Pace (Z4 Threshold)
      - 2m 60-70% Pace (Easy Jog Recovery)
-
-     Cooldown
-     - 10m 65-75% Pace
      ```
+     Only if the user asks for a warm-up/cool-down, add steps such as `- 15m 65-75% Pace` before/after the main set.
    - **Strength Workouts (`sport_type="WeightTraining"`) — Written in Intervals.icu (No Suunto Sync Needed)**:
-     Write the workout plan directly in the `intervals.icu` event `description` as clear, readable text (exercises, sets, reps, RIR/%1RM, and rest intervals) so the athlete can read it directly from their `intervals.icu` calendar.
+     Write the workout plan directly in the `intervals.icu` event `description` as clear, readable text (exercises, sets, reps, RIR/%1RM, and rest intervals) so the athlete can read it directly from their `intervals.icu` calendar. No warm-up or cool-down sections unless explicitly requested.
 4. **Validation & Upload Workflow**:
    - The athlete's upcoming `intervals.icu` calendar is already provided in your system context under **"Pre-fetched tool results"** — use it to avoid double-booking; do not re-request it.
    - Always call `validate_and_preview_training_plan` first to verify Suunto running workout syntax and audit concurrent interference spacing.

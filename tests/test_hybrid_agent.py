@@ -436,6 +436,22 @@ def test_subagent_scope_boundaries_keep_uploads_in_the_planner() -> None:
     assert "upload_training_plan_to_intervals" in PLANNER_SYSTEM_PROMPT
 
 
+def test_planner_makes_warmup_and_cooldown_opt_in() -> None:
+    from hybrid_training_agent.agents.prompts import PLANNER_SYSTEM_PROMPT
+    from hybrid_training_agent.models import PlannedWorkoutInput
+
+    lower = PLANNER_SYSTEM_PROMPT.lower()
+    assert "warm-up & cool-down are opt-in" in lower
+    assert "do not add warm-up or cool-down" in lower
+    # The running example must not demonstrate a default warm-up/cool-down block.
+    assert "Warmup\n- 15m" not in PLANNER_SYSTEM_PROMPT
+    assert "Cooldown\n- 10m" not in PLANNER_SYSTEM_PROMPT
+
+    field_desc = PlannedWorkoutInput.model_fields["description"].description or ""
+    assert "Do NOT add warm-up or cool-down steps" in field_desc
+    assert "Do not add warm-up or cool-down sections" in field_desc
+
+
 def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "test_go_key")
     monkeypatch.setenv("LLM_PROVIDER", "opencode-go")
