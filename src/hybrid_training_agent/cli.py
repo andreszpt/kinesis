@@ -397,6 +397,33 @@ def ask_cmd(
         pending = _pending_question(conversation_messages)
 
 
+def _execute_graph_turn(
+    graph: Any,
+    conversation_messages: list[AnyMessage],
+    mode: str,
+    status_text: str,
+) -> list[AnyMessage]:
+    """Invoke the graph for a single turn, render new messages, and return the history."""
+    prev_len = len(conversation_messages)
+    try:
+        with console.status(status_text):
+            state_out = graph.invoke(
+                {
+                    "messages": conversation_messages,
+                    "next_agent": "supervisor",
+                    "visited_agents": [],
+                    "mode": mode,
+                }
+            )
+    except Exception as exc:
+        console.print(f"[red]Agent Execution Error:[/red] {exc}")
+        return conversation_messages
+
+    updated = list(state_out["messages"])
+    _render_agent_turn(updated, start_idx=prev_len)
+    return updated
+
+
 @app.command("chat")
 def chat_cmd() -> None:
     """Start an interactive multi-turn CLI coaching session with Kinesis."""
@@ -407,6 +434,7 @@ def chat_cmd() -> None:
                 "**Architecture**: LangGraph Supervisor + 3 Sub-Agents (*Analyst*, *Sports Science Researcher*, *Coach & Planner*)\n\n"
                 "**Quick Commands**:\n"
                 "- `/status` — Check Intervals.icu & LLM connection\n"
+                "- `/plan [request]` — Plan one or more workouts (e.g. `/plan 45m easy run tomorrow + strength Friday`)\n"
                 "- `/analyze` — Run instant 28-day Intervals.icu readiness & polarization analysis\n"
                 "- `/evidence` — View curated peer-reviewed hybrid training evidence (PMIDs & DOIs)\n"
                 "- `/clear` — Reset conversation history\n"
@@ -447,25 +475,34 @@ def chat_cmd() -> None:
             console.print("[dim]Conversation history cleared.[/dim]")
             continue
 
-        conversation_messages.append(HumanMessage(content=user_input))
-        prev_len = len(conversation_messages)
+        if user_input == "/plan" or cmd.startswith("/plan "):
+            plan_request = user_input[len("/plan"):].strip()
+            if not plan_request:
+                try:
+                    plan_request = Prompt.ask(
+                        "[bold green]Plan request[/bold green] "
+                        "[dim](e.g. 45m easy run tomorrow + 60m full body strength Friday)[/dim]"
+                    ).strip()
+                except (KeyboardInterrupt, EOFError):
+                    continue
+            if not plan_request:
+                continue
+            conversation_messages.append(HumanMessage(content=plan_request))
+            conversation_messages = _execute_graph_turn(
+                graph,
+                conversation_messages,
+                mode="plan",
+                status_text="[bold cyan]Planning workout(s): Analyst → Researcher (if evidence asked) → Planner...[/bold cyan]",
+            )
+            continue
 
-        try:
-            with console.status(
-                "[bold cyan]Supervisor coordinating Researcher, Analyst, and Planner sub-agents...[/bold cyan]"
-            ):
-                state_out = graph.invoke(
-                    {
-                        "messages": conversation_messages,
-                        "next_agent": "supervisor",
-                        "visited_agents": [],
-                        "mode": "auto",
-                    }
-                )
-            conversation_messages = list(state_out["messages"])
-            _render_agent_turn(conversation_messages, start_idx=prev_len)
-        except Exception as exc:
-            console.print(f"[red]Agent Execution Error:[/red] {exc}")
+        conversation_messages.append(HumanMessage(content=user_input))
+        conversation_messages = _execute_graph_turn(
+            graph,
+            conversation_messages,
+            mode="auto",
+            status_text="[bold cyan]Supervisor coordinating Researcher, Analyst, and Planner sub-agents...[/bold cyan]",
+        )
 
 
 @app.command("mcp")

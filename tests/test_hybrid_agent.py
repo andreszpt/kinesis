@@ -489,6 +489,59 @@ def test_ask_cmd_offers_follow_up_when_agent_asks_a_question(monkeypatch: pytest
     assert list(fake_llm.messages) == []
 
 
+def test_chat_plan_command_uses_plan_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    invocations: list[dict[str, Any]] = []
+
+    class _FakeGraph:
+        def invoke(self, state: dict[str, Any]) -> dict[str, Any]:
+            invocations.append(state)
+            messages = list(state["messages"]) + [
+                AIMessage(content="Planner: 2 workouts ready.", name="Hybrid_Coach_Planner")
+            ]
+            return {"messages": messages, "visited_agents": []}
+
+    monkeypatch.setattr(cli, "build_hybrid_training_graph", lambda: _FakeGraph())
+    inputs = iter(
+        [
+            "/plan a 45m easy run tomorrow and a strength session on Friday",
+            "/quit",
+        ]
+    )
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: next(inputs))
+
+    cli.chat_cmd()
+
+    assert len(invocations) == 1
+    assert invocations[0]["mode"] == "plan"
+    assert (
+        invocations[0]["messages"][-1].content
+        == "a 45m easy run tomorrow and a strength session on Friday"
+    )
+
+
+def test_chat_plan_command_prompts_for_request_when_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    invocations: list[dict[str, Any]] = []
+
+    class _FakeGraph:
+        def invoke(self, state: dict[str, Any]) -> dict[str, Any]:
+            invocations.append(state)
+            return {
+                "messages": list(state["messages"])
+                + [AIMessage(content="Planner: ok", name="Hybrid_Coach_Planner")],
+                "visited_agents": [],
+            }
+
+    monkeypatch.setattr(cli, "build_hybrid_training_graph", lambda: _FakeGraph())
+    inputs = iter(["/plan", "one 60m strength session tomorrow", "/quit"])
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: next(inputs))
+
+    cli.chat_cmd()
+
+    assert len(invocations) == 1
+    assert invocations[0]["mode"] == "plan"
+    assert invocations[0]["messages"][-1].content == "one 60m strength session tomorrow"
+
+
 def test_ask_cmd_is_silent_when_not_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_llm = _RecordingFakeChatModel(
         messages=iter([AIMessage(content="Should the session be upper or lower body focused?")])

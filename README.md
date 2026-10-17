@@ -94,6 +94,8 @@ uv run kinesis status
 
 # 2. Launch interactive multi-turn coaching chat
 uv run kinesis chat
+# In-chat quick commands: /plan [request] (plan one or more workouts), /analyze, /evidence,
+# /status, /clear, /quit. Example: /plan 45m easy run tomorrow + 60m full body strength Friday
 
 # 3. Ask a one-shot question or request a full training plan
 # Plans are practical by default (analyst data check + planner). Add wording like
