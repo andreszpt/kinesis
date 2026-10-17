@@ -31,6 +31,14 @@
 - **Running Workouts (`Run`):** Written in **Intervals.icu Workout Builder syntax** (`- 15m 65-75% Pace`, `5x`, etc.) so `intervals.icu` automatically syncs structured intervals to your **Suunto** watch.
 - **Strength Workouts (`WeightTraining`):** Written directly as readable workout descriptions on your **intervals.icu** calendar (exercises, sets, reps, rest)—no Suunto watch sync or special manual logging needed.
 
+### Latency Optimizations
+`ask` and `chat` are tuned to minimize network trips and model round trips:
+- **Deterministic pre-fetch:** the analyst's profile + training/wellness analysis, the researcher's curated evidence, and the planner's upcoming calendar are fetched up front and injected into the sub-agent context, so an agent answers in one model call instead of spending a turn choosing tools. The analyst honors an explicit window (e.g. `last 60 days`).
+- **Concurrent I/O:** independent tool calls (and pre-fetches) run in a thread pool instead of sequentially.
+- **Connection reuse + read cache:** one pooled `httpx` client serves both intervals.icu and PubMed, and read responses are cached in-process for `KINESIS_CACHE_TTL_SECONDS` (default `60`, `0` disables). Any write (upload/delete) invalidates cached reads.
+- **Lean tool payloads:** the planner binds only `validate_and_preview_training_plan` and `upload_training_plan_to_intervals` (plus the delete tool for removal requests); the literature sub-agent runs only when evidence is requested.
+
+
 ---
 
 ## Quick Start

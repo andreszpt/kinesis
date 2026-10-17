@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -15,15 +18,27 @@ from hybrid_training_agent.agents.prompts import (
     RESEARCHER_SYSTEM_PROMPT,
     SUPERVISOR_SYSTEM_PROMPT,
 )
-from hybrid_training_agent.config import get_chat_model
-from hybrid_training_agent.tools.analytics_tools import ANALYTICS_TOOLS
-from hybrid_training_agent.tools.planner_tools import PLANNER_TOOLS
+from hybrid_training_agent.config import get_chat_model, get_settings
+from hybrid_training_agent.tools.analytics_tools import (
+    analyze_training_and_wellness,
+    fetch_athlete_profile_and_zones,
+)
+from hybrid_training_agent.tools.planner_tools import (
+    delete_planned_event_from_intervals,
+    get_upcoming_intervals_calendar,
+    upload_training_plan_to_intervals,
+    validate_and_preview_training_plan,
+)
 from hybrid_training_agent.tools.science_tools import (
     SCIENCE_TOOLS,
     get_curated_hybrid_training_evidence,
 )
 
 AgentName = Literal["analyst", "researcher", "planner", "FINISH"]
+
+# Wording that means the athlete will manage the intervals.icu calendar, so the planner
+# needs the delete tool bound (otherwise it is left out of the request payload).
+_PLANNER_DELETE_KEYWORDS = ("delete", "remove", "cancel", "unplan", "clear the calendar")
 
 
 class RouteDecision(BaseModel):
@@ -118,13 +133,26 @@ def _run_tool_calling_subagent(
     messages: list[AnyMessage],
     agent_tag: str,
     max_iterations: int = 6,
+    context: str = "",
 ) -> list[AnyMessage]:
-    """Execute a specialist sub-agent with its bound tools in a ReAct loop."""
+    """Execute a specialist sub-agent with its bound tools in a ReAct loop.
+
+    `context` holds pre-fetched tool results that are injected into the system message so
+    the model can answer without spending a round trip deciding which tool to call.
+    """
     tool_map = {t.name: t for t in tools}
-    llm_with_tools = llm.bind_tools(tools)
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+    system_content = system_prompt
+    if context:
+        system_content = (
+            f"{system_prompt}\n\n"
+            "# Pre-fetched tool results (already retrieved; use them directly and do not "
+            f"re-run these tools)\n{context}"
+        )
 
     working_messages: list[AnyMessage] = [
-        SystemMessage(content=system_prompt),
+        SystemMessage(content=system_content),
         *_prepare_subagent_history(messages),
     ]
     new_messages: list[AnyMessage] = []
@@ -137,31 +165,11 @@ def _run_tool_calling_subagent(
         if not response.tool_calls:
             break
 
-        for tc in response.tool_calls:
-            tool_name = tc.get("name", "")
-            tool_args = tc.get("args", {}) or {}
-            tool_id = tc.get("id", tool_name)
-            target_tool = tool_map.get(tool_name)
-            if target_tool is None:
-                obs_content = f'{{"error": "Unknown tool {tool_name}"}}'
-            else:
-                try:
-                    result = target_tool.invoke(tool_args)
-                    obs_content = (
-                        result
-                        if isinstance(result, str)
-                        else __import__("json").dumps(result, ensure_ascii=False, default=str)
-                    )
-                except Exception as exc:
-                    obs_content = __import__("json").dumps({"error": str(exc)})
-
-            tool_msg = ToolMessage(
-                content=obs_content,
-                tool_call_id=tool_id,
-                name=tool_name,
-            )
-            working_messages.append(tool_msg)
-            new_messages.append(tool_msg)
+        # Independent tool calls (e.g. profile + analytics) are I/O bound, so run them
+        # concurrently while preserving the model's original ordering.
+        tool_messages = _execute_tool_calls(response.tool_calls, tool_map)
+        working_messages.extend(tool_messages)
+        new_messages.extend(tool_messages)
 
     # Tag the final AIMessage with the sub-agent name for clear provenance
     if new_messages and isinstance(new_messages[-1], AIMessage):
@@ -169,6 +177,97 @@ def _run_tool_calling_subagent(
         final_ai.name = agent_tag
 
     return new_messages
+
+
+def _execute_tool_call(tool_call: dict[str, Any], tool_map: dict[str, BaseTool]) -> ToolMessage:
+    """Invoke a single tool call and wrap the outcome in a ToolMessage."""
+    tool_name = tool_call.get("name", "")
+    tool_args = tool_call.get("args", {}) or {}
+    tool_id = tool_call.get("id", tool_name)
+    target_tool = tool_map.get(tool_name)
+    if target_tool is None:
+        obs_content = json.dumps({"error": f"Unknown tool {tool_name}"})
+    else:
+        try:
+            result = target_tool.invoke(tool_args)
+            obs_content = (
+                result
+                if isinstance(result, str)
+                else json.dumps(result, ensure_ascii=False, default=str)
+            )
+        except Exception as exc:  # noqa: BLE001 - surface tool failures to the model
+            obs_content = json.dumps({"error": str(exc)})
+
+    return ToolMessage(content=obs_content, tool_call_id=tool_id, name=tool_name)
+
+
+def _execute_tool_calls(
+    tool_calls: list[dict[str, Any]], tool_map: dict[str, BaseTool]
+) -> list[ToolMessage]:
+    if len(tool_calls) <= 1:
+        return [_execute_tool_call(tc, tool_map) for tc in tool_calls]
+    with ThreadPoolExecutor(max_workers=min(len(tool_calls), 8)) as pool:
+        return list(pool.map(lambda tc: _execute_tool_call(tc, tool_map), tool_calls))
+
+
+def _invoke_tool_specs(specs: list[tuple[BaseTool, dict[str, Any]]]) -> list[tuple[str, Any]]:
+    """Run deterministic read-only tools concurrently, returning `(name, result)` pairs."""
+    def run(spec: tuple[BaseTool, dict[str, Any]]) -> tuple[str, Any]:
+        tool_obj, args = spec
+        try:
+            return tool_obj.name, tool_obj.invoke(args)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully to an error payload
+            return tool_obj.name, {"error": str(exc)}
+
+    if len(specs) <= 1:
+        return [run(spec) for spec in specs]
+    with ThreadPoolExecutor(max_workers=min(len(specs), 8)) as pool:
+        return list(pool.map(run, specs))
+
+
+def _format_tool_context(results: list[tuple[str, Any]]) -> str:
+    """Render pre-fetched tool results as a compact JSON block for the system message."""
+    blocks: list[str] = []
+    for name, result in results:
+        payload = (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, ensure_ascii=False, default=str)
+        )
+        blocks.append(f"### `{name}`\n```json\n{payload}\n```")
+    return "\n\n".join(blocks)
+
+
+def _latest_user_text(messages: list[AnyMessage]) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return str(msg.content)
+    return ""
+
+
+def _detect_days_back(user_text: str, default: int = 28) -> int:
+    """Honor an explicit window such as 'last 60 days' when prefetching analyst data."""
+    match = re.search(r"(?:last|past|previous)\s+(\d+)\s*(?:days?|d)\b", user_text, re.IGNORECASE)
+    if not match:
+        return default
+    return max(7, min(int(match.group(1)), 365))
+
+
+def _select_planner_tools(user_text: str) -> list[BaseTool]:
+    """Bind only the planner tools the request can plausibly need.
+
+    The intervals.icu calendar is pre-fetched, and the curated-evidence tool is only
+    relevant when the researcher runs, so both are dropped from the request payload.
+    The delete tool is bound solely for calendar-removal requests.
+    """
+    tools: list[BaseTool] = [
+        validate_and_preview_training_plan,
+        upload_training_plan_to_intervals,
+    ]
+    lower = user_text.lower()
+    if any(kw in lower for kw in _PLANNER_DELETE_KEYWORDS):
+        tools.append(delete_planned_event_from_intervals)
+    return tools
 
 
 def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
@@ -276,11 +375,7 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
         mode = state.get("mode") or "auto"
 
         # Find the latest HumanMessage
-        last_user_msg = ""
-        for msg in reversed(state["messages"]):
-            if isinstance(msg, HumanMessage):
-                last_user_msg = str(msg.content)
-                break
+        last_user_msg = _latest_user_text(state["messages"])
 
         pipeline = classify_intent_pipeline(last_user_msg, mode=mode)
         for candidate in pipeline:
@@ -307,12 +402,30 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
 
     def analyst_node(state: HybridAgentState) -> dict[str, Any]:
         model = _get_llm()
+        user_text = _latest_user_text(state["messages"])
+        # Deterministically pre-fetch the athlete data instead of spending an LLM round
+        # trip on tool selection. Runs with no bound tools so it always answers in one call.
+        if get_settings().has_intervals_credentials:
+            days_back = _detect_days_back(user_text)
+            results = _invoke_tool_specs(
+                [
+                    (fetch_athlete_profile_and_zones, {}),
+                    (analyze_training_and_wellness, {"days_back": days_back}),
+                ]
+            )
+            context = _format_tool_context(results)
+        else:
+            context = (
+                "intervals.icu credentials are not configured, so no athlete data is "
+                "available. State that data could not be retrieved."
+            )
         new_msgs = _run_tool_calling_subagent(
             llm=model,
             system_prompt=ANALYST_SYSTEM_PROMPT,
-            tools=ANALYTICS_TOOLS,
+            tools=[],
             messages=state["messages"],
             agent_tag="Performance_and_Health_Analyst",
+            context=context,
         )
         visited = list(state.get("visited_agents") or [])
         if "analyst" not in visited:
@@ -321,12 +434,17 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
 
     def researcher_node(state: HybridAgentState) -> dict[str, Any]:
         model = _get_llm()
+        # The curated evidence matrix is local and instant: inject it so the researcher only
+        # spends a round trip on a live PubMed/Europe PMC search when it truly needs one.
+        curated = get_curated_hybrid_training_evidence.invoke({"topic": "all"})
+        context = _format_tool_context([("get_curated_hybrid_training_evidence", curated)])
         new_msgs = _run_tool_calling_subagent(
             llm=model,
             system_prompt=RESEARCHER_SYSTEM_PROMPT,
             tools=SCIENCE_TOOLS,
             messages=state["messages"],
             agent_tag="Sports_Science_Researcher",
+            context=context,
         )
         visited = list(state.get("visited_agents") or [])
         if "researcher" not in visited:
@@ -335,14 +453,24 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
 
     def planner_node(state: HybridAgentState) -> dict[str, Any]:
         model = _get_llm()
-        # Planner gets PLANNER_TOOLS + curated evidence lookup so it never lacks citations or syntax validation
-        planner_toolkit = [*PLANNER_TOOLS, get_curated_hybrid_training_evidence]
+        user_text = _latest_user_text(state["messages"])
+        # Pre-fetch the current calendar so the planner does not need a selection round trip,
+        # and bind only the tools the request can actually use.
+        if get_settings().has_intervals_credentials:
+            results = _invoke_tool_specs([(get_upcoming_intervals_calendar, {"days_ahead": 14})])
+            context = _format_tool_context(results)
+        else:
+            context = (
+                "intervals.icu credentials are not configured, so the calendar could not be "
+                "read. Do not attempt to upload; provide the plan for review only."
+            )
         new_msgs = _run_tool_calling_subagent(
             llm=model,
             system_prompt=PLANNER_SYSTEM_PROMPT,
-            tools=planner_toolkit,
+            tools=_select_planner_tools(user_text),
             messages=state["messages"],
             agent_tag="Hybrid_Coach_Planner",
+            context=context,
         )
         visited = list(state.get("visited_agents") or [])
         if "planner" not in visited:

@@ -9,17 +9,26 @@ import respx
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 
+from hybrid_training_agent.agents import graph as graph_module
 from hybrid_training_agent.agents.graph import (
+    _detect_days_back,
+    _select_planner_tools,
     build_hybrid_training_graph,
     classify_intent_pipeline,
 )
 from hybrid_training_agent import cli
 from hybrid_training_agent.cli import _pending_question, extract_message_text
+from hybrid_training_agent.clients.cache import TTLCache
+from hybrid_training_agent.clients.http_client import reset_shared_http_client
 from hybrid_training_agent.clients.intervals_client import (
     IntervalsIcuClient,
+    _intervals_cache,
     validate_intervals_run_syntax,
 )
-from hybrid_training_agent.clients.science_client import ScienceLiteratureClient
+from hybrid_training_agent.clients.science_client import (
+    ScienceLiteratureClient,
+    _science_cache,
+)
 from hybrid_training_agent.config import Settings, get_chat_model
 from hybrid_training_agent.models import PlannedWorkoutInput
 from hybrid_training_agent.tools.analytics_tools import compute_hybrid_analytics
@@ -31,6 +40,19 @@ class _RecordingFakeChatModel(GenericFakeChatModel):
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
         return self
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_tooling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests offline and isolated from the shared read caches."""
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "")
+    reset_shared_http_client()
+    _intervals_cache.clear()
+    _science_cache.clear()
+    yield
+    _intervals_cache.clear()
+    _science_cache.clear()
+    reset_shared_http_client()
 
 
 def test_validate_intervals_run_syntax_valid_and_invalid() -> None:
@@ -431,5 +453,179 @@ def test_extract_message_text_from_content_blocks() -> None:
     import json
 
     assert extract_message_text(json.dumps(blocks)) == "### Hybrid Analysis\n- **CTL**: 52.0"
+
+
+def test_ttl_cache_expiry_and_disable() -> None:
+    cache = TTLCache(ttl=10, max_entries=2)
+    cache.set("k", {"v": 1})
+    cached = cache.get("k")
+    assert cached == {"v": 1}
+    # Mutating a returned value must not poison the cache (deep copy on read).
+    cached["v"] = 999
+    assert cache.get("k") == {"v": 1}
+
+    expired = TTLCache(ttl=0.05, max_entries=2)
+    expired.set("k", 1)
+    import time
+
+    time.sleep(0.3)
+    assert expired.get("k") is None
+
+    disabled = TTLCache(ttl=0)
+    disabled.set("k", 1)
+    assert disabled.get("k") is None
+
+
+def test_intervals_reads_are_cached_and_writes_invalidate() -> None:
+    settings = Settings(intervals_api_key="test_secret", intervals_athlete_id="0")
+    client = IntervalsIcuClient(settings=settings)
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        profile_route = respx_mock.get("/athlete/0").mock(
+            return_value=httpx.Response(200, json={"id": "0", "ctl": 60})
+        )
+        bulk_route = respx_mock.post("/athlete/0/events/bulk").mock(
+            return_value=httpx.Response(200, json=[{"id": 1}])
+        )
+
+        assert client.get_athlete_profile()["ctl"] == 60
+        assert client.get_athlete_profile()["ctl"] == 60
+        assert profile_route.call_count == 1  # second read served from cache
+
+        client.create_events_bulk(
+            [
+                PlannedWorkoutInput(
+                    date="2026-10-20",
+                    name="Session",
+                    sport_type="Run",
+                    description="- 30m 70% Pace",
+                )
+            ]
+        )
+        assert bulk_route.call_count == 1  # any write discards cached reads
+
+        client.get_athlete_profile()
+        assert profile_route.call_count == 2
+
+
+def test_pubmed_search_results_are_cached() -> None:
+    xml = (
+        "<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>1</PMID>"
+        "<Article><ArticleTitle>Cached study</ArticleTitle></Article>"
+        "</MedlineCitation></PubmedArticle></PubmedArticleSet>"
+    )
+    client = ScienceLiteratureClient()
+    with respx.mock(base_url="https://eutils.ncbi.nlm.nih.gov") as respx_mock:
+        search_route = respx_mock.get("/entrez/eutils/esearch.fcgi").mock(
+            return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["1"]}})
+        )
+        fetch_route = respx_mock.get("/entrez/eutils/efetch.fcgi").mock(
+            return_value=httpx.Response(200, text=xml)
+        )
+
+        first = client.search_pubmed("concurrent training", max_results=1)
+        second = client.search_pubmed("concurrent training", max_results=1)
+
+        assert first == second
+        assert first[0]["title"] == "Cached study"
+        assert search_route.call_count == 1
+        assert fetch_route.call_count == 1
+
+
+def test_detect_days_back_from_user_text() -> None:
+    assert _detect_days_back("Create a 60m strength session", default=28) == 28
+    assert _detect_days_back("Analyze my last 60 days please") == 60
+    assert _detect_days_back("review the past 7 days") == 7
+    # Out-of-range windows are clamped to a sane 7..365 range.
+    assert _detect_days_back("last 2 days") == 7
+    assert _detect_days_back("last 9999 days") == 365
+
+
+def test_planner_tool_selection_binds_only_what_is_needed() -> None:
+    names = [t.name for t in _select_planner_tools("Create a 60m full body strength session")]
+    assert names == ["validate_and_preview_training_plan", "upload_training_plan_to_intervals"]
+    # The pre-fetched calendar and curated evidence tools are never bound.
+    assert "get_upcoming_intervals_calendar" not in names
+    assert "get_curated_hybrid_training_evidence" not in names
+
+    delete_names = [t.name for t in _select_planner_tools("Delete the workout on Friday")]
+    assert "delete_planned_event_from_intervals" in delete_names
+
+
+def test_analyst_node_prefetches_data_and_skips_tool_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_key")
+    calls: dict[str, Any] = {}
+
+    class _StubTool:
+        def __init__(self, name: str, result: Any) -> None:
+            self.name = name
+            self.result = result
+
+        def invoke(self, args: dict[str, Any]) -> Any:
+            calls[self.name] = args
+            return self.result
+
+    monkeypatch.setattr(
+        graph_module,
+        "fetch_athlete_profile_and_zones",
+        _StubTool("fetch_athlete_profile_and_zones", {"name": "Alex", "ctl": 60}),
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "analyze_training_and_wellness",
+        _StubTool("analyze_training_and_wellness", {"load_and_form": {"ctl_fitness": 60.0}}),
+    )
+
+    seen_systems: list[str] = []
+
+    class RecordingChatModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return self
+
+        def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            seen_systems.append(str(input[0].content))
+            return super().invoke(input, config=config, **kwargs)
+
+    fake_llm = RecordingChatModel(messages=iter([AIMessage(content="Analyst Report: ready.")]))
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Analyze my last 60 days on intervals.icu")],
+            "next_agent": "supervisor",
+            "visited_agents": [],
+            "mode": "analyze",
+        }
+    )
+
+    # Data was fetched deterministically (once) and the window came from the user's text.
+    assert calls["analyze_training_and_wellness"] == {"days_back": 60}
+    assert "fetch_athlete_profile_and_zones" in calls
+    assert seen_systems and "Pre-fetched tool results" in seen_systems[0]
+    assert "Alex" in seen_systems[0]
+
+
+def test_analyst_node_reports_missing_credentials_without_prefetch() -> None:
+    seen_systems: list[str] = []
+
+    class RecordingChatModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return self
+
+        def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            seen_systems.append(str(input[0].content))
+            return super().invoke(input, config=config, **kwargs)
+
+    fake_llm = RecordingChatModel(messages=iter([AIMessage(content="No data available.")]))
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Analyze my intervals.icu data")],
+            "next_agent": "supervisor",
+            "visited_agents": [],
+            "mode": "analyze",
+        }
+    )
+
+    assert seen_systems and "credentials are not configured" in seen_systems[0]
+
 
 

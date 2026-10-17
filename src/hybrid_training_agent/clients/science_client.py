@@ -3,13 +3,17 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from typing import Any
 
-import httpx
-
+from hybrid_training_agent.clients.cache import TTLCache
+from hybrid_training_agent.clients.http_client import get_shared_http_client
 from hybrid_training_agent.config import Settings, get_settings
 from hybrid_training_agent.models import ScientificCitation
 
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 EUROPE_PMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+# PubMed/Europe PMC queries are deterministic for a given query string, so a short-lived
+# cache avoids repeating the esearch + efetch round trip within a run or chat session.
+_science_cache = TTLCache()
 
 # Foundational peer-reviewed meta-analyses, systematic reviews, and RCTs on Hybrid Running + Strength Training
 CURATED_HYBRID_EVIDENCE: dict[str, list[ScientificCitation]] = {
@@ -224,6 +228,11 @@ class ScienceLiteratureClient:
         prefer_reviews_and_trials: bool = True,
     ) -> list[dict[str, Any]]:
         """Search PubMed E-Utilities and return parsed paper metadata + abstracts."""
+        cache_key = ("pubmed_search", query.strip(), max_results, prefer_reviews_and_trials)
+        cached = _science_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         effective_query = query.strip()
         if prefer_reviews_and_trials and "meta-analysis" not in effective_query.lower():
             effective_query = (
@@ -231,13 +240,30 @@ class ScienceLiteratureClient:
                 "(Meta-Analysis[pt] OR Systematic Review[pt] OR Randomized Controlled Trial[pt] OR Review[pt])"
             )
 
-        with httpx.Client(timeout=self.timeout) as client:
+        client = get_shared_http_client(self.timeout)
+        esearch_resp = client.get(
+            f"{PUBMED_BASE}/esearch.fcgi",
+            params=self._pubmed_params(
+                {
+                    "db": "pubmed",
+                    "term": effective_query,
+                    "retmax": max_results,
+                    "retmode": "json",
+                    "sort": "relevance",
+                }
+            ),
+        )
+        esearch_resp.raise_for_status()
+        id_list = esearch_resp.json().get("esearchresult", {}).get("idlist", [])
+
+        # Fallback to broader query if filter was too strict
+        if not id_list and effective_query != query.strip():
             esearch_resp = client.get(
                 f"{PUBMED_BASE}/esearch.fcgi",
                 params=self._pubmed_params(
                     {
                         "db": "pubmed",
-                        "term": effective_query,
+                        "term": query.strip(),
                         "retmax": max_results,
                         "retmode": "json",
                         "sort": "relevance",
@@ -245,57 +271,37 @@ class ScienceLiteratureClient:
                 ),
             )
             esearch_resp.raise_for_status()
-            id_list = (
-                esearch_resp.json()
-                .get("esearchresult", {})
-                .get("idlist", [])
-            )
+            id_list = esearch_resp.json().get("esearchresult", {}).get("idlist", [])
 
-            # Fallback to broader query if filter was too strict
-            if not id_list and effective_query != query.strip():
-                esearch_resp = client.get(
-                    f"{PUBMED_BASE}/esearch.fcgi",
-                    params=self._pubmed_params(
-                        {
-                            "db": "pubmed",
-                            "term": query.strip(),
-                            "retmax": max_results,
-                            "retmode": "json",
-                            "sort": "relevance",
-                        }
-                    ),
-                )
-                esearch_resp.raise_for_status()
-                id_list = (
-                    esearch_resp.json()
-                    .get("esearchresult", {})
-                    .get("idlist", [])
-                )
-
-        if not id_list:
-            return []
-
-        return self.fetch_pubmed_by_pmids(id_list)
+        results = self.fetch_pubmed_by_pmids(id_list) if id_list else []
+        _science_cache.set(cache_key, results)
+        return results
 
     def fetch_pubmed_by_pmids(self, pmids: list[str]) -> list[dict[str, Any]]:
         """Fetch full titles, authors, journals, years, DOIs, and abstracts for a list of PMIDs."""
         if not pmids:
             return []
 
-        with httpx.Client(timeout=self.timeout) as client:
-            efetch_resp = client.get(
-                f"{PUBMED_BASE}/efetch.fcgi",
-                params=self._pubmed_params(
-                    {
-                        "db": "pubmed",
-                        "id": ",".join(str(p).strip() for p in pmids),
-                        "retmode": "xml",
-                    }
-                ),
-            )
-            efetch_resp.raise_for_status()
+        cache_key = ("pubmed_fetch", tuple(str(p).strip() for p in pmids))
+        cached = _science_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        return self._parse_pubmed_xml(efetch_resp.text)
+        efetch_resp = get_shared_http_client(self.timeout).get(
+            f"{PUBMED_BASE}/efetch.fcgi",
+            params=self._pubmed_params(
+                {
+                    "db": "pubmed",
+                    "id": ",".join(str(p).strip() for p in pmids),
+                    "retmode": "xml",
+                }
+            ),
+        )
+        efetch_resp.raise_for_status()
+
+        papers = self._parse_pubmed_xml(efetch_resp.text)
+        _science_cache.set(cache_key, papers)
+        return papers
 
     @staticmethod
     def _parse_pubmed_xml(xml_text: str) -> list[dict[str, Any]]:
@@ -365,18 +371,22 @@ class ScienceLiteratureClient:
 
     def search_europe_pmc(self, query: str, max_results: int = 5) -> list[dict[str, Any]]:
         """Search Europe PMC REST API for open-access sports science literature and citation counts."""
-        with httpx.Client(timeout=self.timeout) as client:
-            resp = client.get(
-                EUROPE_PMC_BASE,
-                params={
-                    "query": query,
-                    "format": "json",
-                    "pageSize": max_results,
-                    "resultType": "core",
-                },
-            )
-            resp.raise_for_status()
-            results = resp.json().get("resultList", {}).get("result", [])
+        cache_key = ("europe_pmc", query.strip(), max_results)
+        cached = _science_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        resp = get_shared_http_client(self.timeout).get(
+            EUROPE_PMC_BASE,
+            params={
+                "query": query,
+                "format": "json",
+                "pageSize": max_results,
+                "resultType": "core",
+            },
+        )
+        resp.raise_for_status()
+        results = resp.json().get("resultList", {}).get("result", [])
 
         papers: list[dict[str, Any]] = []
         for item in results:
@@ -399,6 +409,7 @@ class ScienceLiteratureClient:
                     "abstract": item.get("abstractText", "No abstract available."),
                 }
             )
+        _science_cache.set(cache_key, papers)
         return papers
 
     @staticmethod

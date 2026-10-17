@@ -6,8 +6,14 @@ from typing import Any
 
 import httpx
 
+from hybrid_training_agent.clients.cache import TTLCache
+from hybrid_training_agent.clients.http_client import get_shared_http_client
 from hybrid_training_agent.config import Settings, get_settings
 from hybrid_training_agent.models import PlannedWorkoutInput
+
+# Shared read cache: sub-agents and multi-turn chat requests repeatedly hit the same
+# profile/wellness/activity endpoints within seconds of each other.
+_intervals_cache = TTLCache()
 
 
 class IntervalsIcuError(Exception):
@@ -86,22 +92,43 @@ class IntervalsIcuClient:
         path: str,
         params: dict[str, Any] | None = None,
         json_body: Any = None,
+        *,
+        use_cache: bool | None = None,
     ) -> Any:
         auth = self._require_credentials()
+        method_upper = method.upper()
         url = f"{self.base_url}/{path.lstrip('/')}"
+        cache_key = (
+            method_upper,
+            url,
+            tuple(sorted((str(k), str(v)) for k, v in (params or {}).items())),
+        )
+        cacheable = method_upper == "GET" if use_cache is None else use_cache
+        if cacheable:
+            cached = _intervals_cache.get(cache_key)
+            if cached is not None:
+                return cached
         try:
-            with httpx.Client(auth=auth, timeout=self.timeout) as client:
-                response = client.request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=json_body,
-                    headers={"Accept": "application/json"},
-                )
-                response.raise_for_status()
-                if not response.content:
-                    return {}
-                return response.json()
+            response = get_shared_http_client(self.timeout).request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_body,
+                headers={"Accept": "application/json"},
+                auth=auth,
+            )
+            response.raise_for_status()
+            if not response.content:
+                data: Any = {}
+            else:
+                data = response.json()
+            if method_upper == "GET":
+                if cacheable:
+                    _intervals_cache.set(cache_key, data)
+            else:
+                # Any write invalidates cached reads so uploads/deletes are reflected immediately.
+                _intervals_cache.clear()
+            return data
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500] if exc.response else str(exc)
             raise IntervalsIcuError(
