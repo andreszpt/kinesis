@@ -5,6 +5,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -309,12 +310,78 @@ def _latest_user_text(messages: list[AnyMessage]) -> str:
     return ""
 
 
+_MONTH_NUMBERS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_UNIT_DAYS = {
+    "d": 1, "day": 1, "days": 1,
+    "w": 7, "week": 7, "weeks": 7,
+    "mo": 30, "month": 30, "months": 30,
+    "y": 365, "year": 365, "years": 365,
+}
+_MAX_WINDOW_DAYS = 3650
+
+
+def _days_since(start: date) -> int:
+    return max(7, min((date.today() - start).days + 1, _MAX_WINDOW_DAYS))
+
+
 def _detect_days_back(user_text: str, default: int = 28) -> int:
-    """Honor an explicit window such as 'last 60 days' when prefetching analyst data."""
-    match = re.search(r"(?:last|past|previous)\s+(\d+)\s*(?:days?|d)\b", user_text, re.IGNORECASE)
-    if not match:
-        return default
-    return max(7, min(int(match.group(1)), 365))
+    """Resolve the history window a request refers to (in days).
+
+    Understands spans ("last 60 days", "past 3 months"), explicit dates ("since 2025-03-01"),
+    years ("from 2026", "this year", "ytd") and month references ("since May 2025"), so a
+    question about a period pre-fetches exactly that period. How the data is then grouped
+    (weekly, monthly, per sport, ...) is the analyst's job, not a routing concern.
+    """
+    lower = user_text.lower()
+
+    explicit_date = re.search(r"(?:since|from|after)\s+(20\d{2})-(\d{1,2})-(\d{1,2})", lower)
+    if explicit_date:
+        return _days_since(
+            date(int(explicit_date.group(1)), int(explicit_date.group(2)), int(explicit_date.group(3)))
+        )
+    explicit_month_date = re.search(r"(?:since|from|after)\s+(20\d{2})-(\d{1,2})\b", lower)
+    if explicit_month_date:
+        return _days_since(
+            date(int(explicit_month_date.group(1)), int(explicit_month_date.group(2)), 1)
+        )
+
+    span = re.search(
+        r"(?:last|past|previous|trailing|final)\s+(\d+)\s*"
+        r"(d|day|days|w|week|weeks|mo|month|months|y|year|years)\b",
+        lower,
+    )
+    if span:
+        return max(7, min(int(span.group(1)) * _UNIT_DAYS[span.group(2)], _MAX_WINDOW_DAYS))
+
+    month_year = re.search(r"(?:since|from|after)\s+([a-z]{3,9})\s+(20\d{2})", lower)
+    if month_year and month_year.group(1) in _MONTH_NUMBERS:
+        return _days_since(
+            date(int(month_year.group(2)), _MONTH_NUMBERS[month_year.group(1)], 1)
+        )
+
+    year_match = re.search(r"\b(?:from|since|in|during)\s+(20\d{2})\b", lower) or re.search(
+        r"\b(20\d{2})\b", lower
+    )
+    if year_match:
+        return _days_since(date(int(year_match.group(1)), 1, 1))
+
+    if any(kw in lower for kw in ("this year", "year to date", "year-to-date", "ytd")):
+        return _days_since(date(date.today().year, 1, 1))
+
+    month_match = re.search(r"(?:since|from|after)\s+([a-z]{3,9})", lower)
+    if month_match and month_match.group(1) in _MONTH_NUMBERS:
+        month = _MONTH_NUMBERS[month_match.group(1)]
+        start = date(date.today().year, month, 1)
+        if start > date.today():
+            start = date(date.today().year - 1, month, 1)
+        return _days_since(start)
+
+    return default
 
 
 def _select_analyst_tools(user_text: str) -> list[BaseTool]:

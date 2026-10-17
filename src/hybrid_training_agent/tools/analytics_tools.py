@@ -286,7 +286,35 @@ def compute_hybrid_analytics(
             "warnings_count": len(interference_warnings),
             "warnings": interference_warnings,
         },
+        # Compact per-activity rows (ascending). The analyst groups these by whatever period
+        # or field the user asks for (weekly, monthly, per sport, ...) instead of the tool
+        # hard-coding any single grouping.
+        "activity_log": compact_activity_log(activities),
     }
+
+
+def compact_activity_log(
+    activities: list[dict[str, Any]], limit: int = 750
+) -> list[dict[str, Any]]:
+    """Reduce raw activities to compact, ascending rows suitable for regrouping."""
+    rows: list[dict[str, Any]] = []
+    for act in sorted(activities, key=lambda a: str(a.get("start_date_local") or "")):
+        start = str(act.get("start_date_local") or "")
+        moving_time_s = float(act.get("moving_time") or act.get("elapsed_time") or 0.0)
+        distance_m = act.get("distance")
+        rows.append(
+            {
+                "date": start[:10],
+                "type": str(act.get("type") or ""),
+                "name": act.get("name"),
+                "distance_km": round(float(distance_m) / 1000.0, 2) if distance_m else None,
+                "duration_min": round(moving_time_s / 60.0, 1) if moving_time_s else None,
+                "load": act.get("icu_training_load"),
+            }
+        )
+    if limit and len(rows) > limit:
+        return rows[-limit:]
+    return rows
 
 
 @tool
@@ -345,11 +373,13 @@ def analyze_training_and_wellness(days_back: int = 28) -> dict[str, Any]:
     except IntervalsIcuError as exc:
         return {"error": str(exc)}
 
-    return compute_hybrid_analytics(
+    report = compute_hybrid_analytics(
         wellness_records=wellness,
         activities=activities,
         days_back=days_back,
     )
+    report["window"] = {"oldest": oldest, "newest": newest, "days": days_back}
+    return report
 
 
 ANALYTICS_TOOLS = [

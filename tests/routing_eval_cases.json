@@ -18,6 +18,7 @@
   {"prompt": "how did I execute my last session", "expected_pipeline": ["analyst"]},
   {"prompt": "show me my best efforts", "expected_pipeline": ["analyst"]},
   {"prompt": "what's my training plan?", "expected_pipeline": ["analyst"]},
+  {"prompt": "analyze how many kms did I run each month from 2026", "expected_pipeline": ["analyst"]},
 
   {"prompt": "What does PubMed say about the interference effect?", "expected_pipeline": ["researcher"]},
   {"prompt": "is there evidence about polarized training", "expected_pipeline": ["researcher"]},

@@ -170,6 +170,25 @@ def test_compute_hybrid_analytics_and_interference() -> None:
     assert report["strength_summary"]["total_sessions"] == 1
     assert report["concurrent_interference_audit"]["warnings_count"] == 1
     assert "3.0h apart" in report["concurrent_interference_audit"]["warnings"][0]
+    # A compact per-activity log is available for arbitrary regrouping (weekly, monthly, ...).
+    assert report["activity_log"] == [
+        {
+            "date": "2026-10-13",
+            "type": "Run",
+            "name": "Easy Aerobic Run",
+            "distance_km": 10.0,
+            "duration_min": 50.0,
+            "load": 58.0,
+        },
+        {
+            "date": "2026-10-13",
+            "type": "WeightTraining",
+            "name": "Strength Training",
+            "distance_km": None,
+            "duration_min": 55.0,
+            "load": 25.0,
+        },
+    ]
 
 
 def test_audit_planned_workouts_and_bulk_upload() -> None:
@@ -1030,12 +1049,31 @@ def test_pubmed_search_results_are_cached() -> None:
 
 
 def test_detect_days_back_from_user_text() -> None:
+    from datetime import date
+
     assert _detect_days_back("Create a 60m strength session", default=28) == 28
     assert _detect_days_back("Analyze my last 60 days please") == 60
     assert _detect_days_back("review the past 7 days") == 7
-    # Out-of-range windows are clamped to a sane 7..365 range.
+    assert _detect_days_back("past 3 months") == 90
+    # Out-of-range windows are clamped to a sane 7..3650 range.
     assert _detect_days_back("last 2 days") == 7
-    assert _detect_days_back("last 9999 days") == 365
+    assert _detect_days_back("last 9999 days") == 3650
+
+    # Explicit dates / years / months widen the pre-fetch window.
+    expected_ytd = (date.today() - date(date.today().year, 1, 1)).days + 1
+    assert _detect_days_back("how many kms did I run each month from 2026") == expected_ytd
+    assert _detect_days_back("what did I do this year") == expected_ytd
+    assert _detect_days_back("analyze my volume since 2025") > 250
+    assert _detect_days_back("rides since May 2024") == (
+        date.today() - date(2024, 5, 1)
+    ).days + 1
+    assert _detect_days_back("everything since 2025-03-01") == (
+        date.today() - date(2025, 3, 1)
+    ).days + 1
+    may_start = date(date.today().year, 5, 1)
+    if may_start > date.today():
+        may_start = date(may_start.year - 1, 5, 1)
+    assert _detect_days_back("how far did I run since May") == (date.today() - may_start).days + 1
 
 
 def test_planner_tool_selection_binds_only_what_is_needed() -> None:
@@ -1099,6 +1137,45 @@ def test_analyst_node_prefetches_data_and_skips_tool_selection(monkeypatch: pyte
     assert "fetch_athlete_profile_and_zones" in calls
     assert seen_systems and "Pre-fetched tool results" in seen_systems[0]
     assert "Alex" in seen_systems[0]
+
+
+def test_analyst_prefetch_window_follows_an_explicit_date_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import date
+
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_key")
+    calls: dict[str, Any] = {}
+
+    class _StubTool:
+        def __init__(self, name: str, result: Any) -> None:
+            self.name = name
+            self.result = result
+
+        def invoke(self, args: dict[str, Any]) -> Any:
+            calls[self.name] = args
+            return self.result
+
+    monkeypatch.setattr(
+        graph_module, "fetch_athlete_profile_and_zones", _StubTool("fetch_athlete_profile_and_zones", {})
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "analyze_training_and_wellness",
+        _StubTool("analyze_training_and_wellness", {}),
+    )
+    fake_llm = _RecordingFakeChatModel(messages=iter([AIMessage(content="Analyst: ok.")]))
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="how many kms did I run each month since 2025")],
+            "visited_agents": [],
+            "mode": "analyze",
+        }
+    )
+
+    expected = (date.today() - date(2025, 1, 1)).days + 1
+    assert calls["analyze_training_and_wellness"] == {"days_back": expected}
 
 
 def test_analyst_node_reports_missing_credentials_without_prefetch() -> None:

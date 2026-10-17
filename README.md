@@ -45,6 +45,7 @@ Beyond the pre-fetched load/wellness snapshot, the analyst can drill into the at
 - **`analyze_activity_execution`** — detected intervals/reps (duration, distance, avg pace/HR/power, intensity) plus a compact stream summary (averages, bests, first/second-half drift).
 - **`search_similar_interval_sessions`** / **`search_completed_activities`** — find comparable past sessions ("when did I last run 5×1km at this pace?").
 - **`get_activity_interval_stats`** / **`get_activity_best_efforts`** — arbitrary-slice stats and best efforts (duration or distance).
+- **Date-aware aggregation:** when the request references a period (`since 2025`, `last 3 months`, `this year`), the pre-fetched window covers exactly that period and includes a compact per-activity `activity_log`. The analyst groups those rows however you ask — weekly, monthly, per sport, cumulative — and reports exact sums. There is no per-period tool and no hard-coded grouping.
 
 ### Workout Library, Plans & Calendar Edits (Planner)
 - **`get_workout_library`** / **`get_athlete_training_plan`** — inspect saved workouts, folders/plans and the applied plan.
@@ -64,7 +65,7 @@ The planner must show that preview to you and ask for explicit confirmation, the
 
 ### Latency Optimizations
 `ask` and `chat` are tuned to minimize network trips and model round trips:
-- **Deterministic pre-fetch:** the analyst's profile + training/wellness analysis, the researcher's curated evidence, and the planner's upcoming calendar are fetched up front and injected into the sub-agent context, so an agent answers in one model call instead of spending a turn choosing tools. The analyst honors an explicit window (e.g. `last 60 days`).
+- **Deterministic pre-fetch:** the analyst's profile + training/wellness analysis, the researcher's curated evidence, and the planner's upcoming calendar are fetched up front and injected into the sub-agent context, so an agent answers in one model call instead of spending a turn choosing tools. The analyst honors the period the request refers to (`last 60 days`, `since 2025`, `this year`) and includes a per-activity `activity_log` for on-the-fly grouping.
 - **Concurrent I/O:** independent tool calls (and pre-fetches) run in a thread pool instead of sequentially.
 - **Connection reuse + read cache:** one pooled `httpx` client serves both intervals.icu and PubMed, and read responses are cached in-process for `KINESIS_CACHE_TTL_SECONDS` (default `60`, `0` disables). Any write (upload/delete) invalidates cached reads.
 - **Lean tool payloads:** the planner normally binds only `validate_and_preview_training_plan` + `upload_training_plan_to_intervals`, adding delete/update/library tools solely when the request mentions them; the analyst's benchmarking tools are bound only for analysis-style requests; the literature sub-agent runs only when evidence is requested.
