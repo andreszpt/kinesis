@@ -15,6 +15,7 @@ from hybrid_training_agent.agents.graph import (
     _select_analyst_tools,
     _select_planner_tools,
     build_hybrid_training_graph,
+    classify_intent,
     classify_intent_pipeline,
 )
 from hybrid_training_agent import cli
@@ -829,6 +830,112 @@ def test_analyst_prompt_lists_read_only_analysis_tools() -> None:
         "get_activity_best_efforts",
     ):
         assert tool_name in ANALYST_SYSTEM_PROMPT
+
+
+def test_routing_eval_set() -> None:
+    """Tier-1 heuristic regression set: intent -> expected pipeline (or ambiguity)."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).parent / "routing_eval_cases.json").read_text(encoding="utf-8")
+    )
+    failures = []
+    for case in cases:
+        plan = classify_intent(case["prompt"], mode=case.get("mode", "auto"))
+        if case.get("confident", True):
+            if plan.pipeline != case["expected_pipeline"]:
+                failures.append(
+                    {
+                        "prompt": case["prompt"],
+                        "got": plan.pipeline,
+                        "expected": case["expected_pipeline"],
+                    }
+                )
+        elif plan.confident:
+            failures.append({"prompt": case["prompt"], "got": "confident", "expected": "ambiguous"})
+    assert not failures, failures
+
+
+class _StubRouterLLM:
+    """Minimal stand-in for a structured-output router model."""
+
+    def __init__(self, decision: str, fail: bool = False) -> None:
+        self.decision = decision
+        self.fail = fail
+        self.calls = 0
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
+        outer = self
+
+        class _Structured:
+            def invoke(self, messages: Any, config: Any = None, **kwargs: Any) -> Any:
+                outer.calls += 1
+                if outer.fail:
+                    raise RuntimeError("router unavailable")
+                from hybrid_training_agent.agents.graph import RouteDecision
+
+                return RouteDecision(next_agent=outer.decision)
+
+        return _Structured()
+
+
+def test_confident_turn_never_calls_the_llm_router() -> None:
+    llm = _RecordingFakeChatModel(messages=iter([AIMessage(content="Analyst: 25 km this week.")]))
+    router = _StubRouterLLM("planner")
+    graph = build_hybrid_training_graph(llm=llm, router_llm=router)
+    state = graph.invoke(
+        {
+            "messages": [HumanMessage(content="how many kms did I run this week")],
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+    assert state["visited_agents"] == ["analyst"]
+    assert state["router"] == "heuristic"
+    assert router.calls == 0
+
+
+def test_llm_router_handles_ambiguous_follow_up() -> None:
+    llm = _RecordingFakeChatModel(
+        messages=iter([AIMessage(content="Planner: here is the 60m session.")])
+    )
+    router = _StubRouterLLM("planner")
+    graph = build_hybrid_training_graph(llm=llm, router_llm=router)
+    state = graph.invoke(
+        {
+            "messages": [HumanMessage(content="sounds good, go ahead")],
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+    assert state["router"] == "llm"
+    assert state["visited_agents"] == ["planner"]
+    # Decided once, then asked again after the hop (and stopped since planner was already run).
+    assert router.calls == 2
+
+
+def test_supervisor_falls_back_to_heuristic_when_router_fails() -> None:
+    llm = _RecordingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Analyst: overview."),
+                AIMessage(content="Planner: plan."),
+            ]
+        )
+    )
+    router = _StubRouterLLM("planner", fail=True)
+    graph = build_hybrid_training_graph(llm=llm, router_llm=router)
+    state = graph.invoke(
+        {
+            "messages": [HumanMessage(content="ok do that")],
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+    assert state["router"] == "heuristic-fallback"
+    assert state["visited_agents"] == ["analyst", "planner"]
+    assert router.calls == 1
 
 
 def test_extract_message_text_from_content_blocks() -> None:

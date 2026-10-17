@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -10,6 +12,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from hybrid_training_agent.agents.prompts import (
@@ -109,6 +112,18 @@ class HybridAgentState(TypedDict):
     next_agent: str
     visited_agents: list[str]
     mode: str
+    # Routing (tier 1 heuristic vs tier 2 LLM) for the current user turn.
+    router: str
+    pipeline: list[str]
+
+
+@dataclass(frozen=True)
+class RoutingPlan:
+    """Tier-1 heuristic routing result for a single user turn."""
+
+    pipeline: list[str]
+    confident: bool
+    reason: str
 
 
 _THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
@@ -400,6 +415,9 @@ _QUESTION_MARKERS = (
     "how far",
     "how long",
     "how often",
+    "how did",
+    "how is",
+    "how are",
     "what was",
     "what's my",
     "whats my",
@@ -467,18 +485,21 @@ _ANALYSIS_KEYWORDS = (
 )
 
 
-def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
-    """Determine the optimal ordered sequence of specialist sub-agents for a user request.
+def classify_intent(user_text: str, mode: str = "auto") -> RoutingPlan:
+    """Tier-1 heuristic routing for a user request.
 
     Planning requires explicit planning intent (a plan keyword, or an action verb aimed at a
-    workout/training noun) so that data questions like "how many kms did I run this week" go
-    to the analyst only. The literature sub-agent is only added when the user explicitly asks
-    for scientific evidence/citations.
+    workout/training noun) so data questions like "how many kms did I run this week" go to the
+    analyst only. The literature sub-agent is only added when the user explicitly asks for
+    scientific evidence/citations.
+
+    When nothing matches, the plan is flagged `confident=False` so the graph can fall back to
+    the Tier-2 LLM supervisor instead of guessing.
     """
     if mode == "research":
-        return ["researcher"]
+        return RoutingPlan(["researcher"], True, "mode=research")
     if mode == "analyze":
-        return ["analyst"]
+        return RoutingPlan(["analyst"], True, "mode=analyze")
 
     lower = user_text.lower()
     is_question = any(marker in lower for marker in _QUESTION_MARKERS)
@@ -500,53 +521,120 @@ def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
         if wants_evidence:
             pipeline.append("researcher")
         pipeline.append("planner")
-        return pipeline
+        return RoutingPlan(pipeline, True, "explicit planning intent")
 
     if wants_analysis and wants_evidence:
-        return ["analyst", "researcher"]
+        return RoutingPlan(["analyst", "researcher"], True, "analysis + evidence")
     if wants_evidence:
-        return ["researcher"]
+        return RoutingPlan(["researcher"], True, "evidence request")
     if wants_analysis:
-        return ["analyst"]
+        return RoutingPlan(["analyst"], True, "data/analysis question")
 
-    # No explicit keywords: inspect the data, then produce the answer.
-    return ["analyst", "planner"]
+    # No explicit signal (e.g. a short follow-up like "sounds good, go ahead"): not confident,
+    # so the Tier-2 LLM supervisor can read the conversation and decide.
+    return RoutingPlan(["analyst", "planner"], False, "no explicit intent signal")
 
 
-def build_hybrid_training_graph(llm: BaseChatModel | None = None):
-    """Build and compile the LangGraph Supervisor + 3 Sub-Agents state graph."""
+def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
+    """Backwards-compatible wrapper returning just the Tier-1 pipeline."""
+    return classify_intent(user_text, mode=mode).pipeline
+
+
+def build_hybrid_training_graph(
+    llm: BaseChatModel | None = None,
+    router_llm: BaseChatModel | None = None,
+):
+    """Build and compile the LangGraph Supervisor + 3 Sub-Agents state graph.
+
+    Routing is three-tiered:
+      1. Tier 1 - deterministic heuristic (`classify_intent`). Used when the intent is explicit.
+      2. Tier 2 - structured-output LLM supervisor (`router_llm`, defaulting to `llm`), consulted
+         only when Tier 1 is not confident (e.g. short follow-ups like "sounds good, go ahead").
+      3. Tier 3 - the supervisor is a real per-step loop: it returns a `Command` for the next hop
+         (one sub-agent at a time) instead of a fixed pipeline, so it can adapt mid-run.
+    """
     def _get_llm() -> BaseChatModel:
         return llm if llm is not None else get_chat_model()
 
-    def supervisor_node(state: HybridAgentState) -> dict[str, Any]:
-        visited = list(state.get("visited_agents") or [])
-        mode = state.get("mode") or "auto"
+    def _get_router_llm() -> BaseChatModel | None:
+        """Tier-2/3 router model: explicit override, KINESIS_ROUTER_MODEL, else the main model."""
+        if router_llm is not None:
+            return router_llm
+        model_name = os.getenv("KINESIS_ROUTER_MODEL", "").strip()
+        if model_name:
+            return get_chat_model(model=model_name)
+        if llm is not None:
+            return llm
+        return get_chat_model()
 
-        # Find the latest HumanMessage
-        last_user_msg = _latest_user_text(state["messages"])
-
-        pipeline = classify_intent_pipeline(last_user_msg, mode=mode)
+    def _next_hop(pipeline: list[str], visited: list[str]) -> str:
         for candidate in pipeline:
             if candidate not in visited:
-                return {"next_agent": candidate}
+                return candidate
+        return "FINISH"
 
-        # Optional LLM supervisor check if pipeline wasn't triggered
-        if not visited:
-            try:
-                model = _get_llm()
-                structured_sup = model.with_structured_output(RouteDecision)
-                decision: RouteDecision = structured_sup.invoke(
-                    [
-                        SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-                        *state["messages"],
-                    ]
+    def _target(agent: str) -> str:
+        return END if agent in ("FINISH", "__end__") else agent
+
+    def _llm_route(state: HybridAgentState, visited: list[str]) -> str | None:
+        """Tier-2/Tier-3 LLM routing. Returns the next agent, or None on failure."""
+        model = _get_router_llm()
+        if model is None:
+            return None
+        try:
+            structured = model.with_structured_output(RouteDecision)
+            visited_hint = ", ".join(visited) if visited else "none"
+            decision: RouteDecision = structured.invoke(
+                [
+                    SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+                    *_prepare_subagent_history(state["messages"]),
+                    HumanMessage(
+                        content=(
+                            f"Sub-agents already run this turn: {visited_hint}. "
+                            "Reply with the single next sub-agent to run, or FINISH."
+                        )
+                    ),
+                ]
+            )
+            return decision.next_agent
+        except Exception:  # noqa: BLE001 - routing must never crash the turn
+            return None
+
+    def supervisor_node(state: HybridAgentState) -> Command:
+        visited = list(state.get("visited_agents") or [])
+        mode = state.get("mode") or "auto"
+        user_text = _latest_user_text(state["messages"])
+        pipeline = list(state.get("pipeline") or [])
+        router = state.get("router") or ""
+
+        # First call of a turn: decide who should act, using Tier 1 then (if unsure) Tier 2.
+        if not pipeline and not router:
+            plan = classify_intent(user_text, mode=mode)
+            if plan.confident:
+                return Command(
+                    goto=_target(_next_hop(plan.pipeline, visited)),
+                    update={"pipeline": plan.pipeline, "router": "heuristic"},
                 )
-                if decision.next_agent in ("analyst", "researcher", "planner"):
-                    return {"next_agent": decision.next_agent}
-            except Exception:
-                return {"next_agent": "analyst"}
+            decision = _llm_route(state, visited)
+            if decision and decision not in visited:
+                return Command(
+                    goto=_target(decision),
+                    update={"pipeline": plan.pipeline, "router": "llm"},
+                )
+            # Router unavailable/failed or repeated an agent: fall back to the heuristic plan.
+            return Command(
+                goto=_target(_next_hop(plan.pipeline, visited)),
+                update={"pipeline": plan.pipeline, "router": "heuristic-fallback"},
+            )
 
-        return {"next_agent": "FINISH"}
+        # Tier-3 loop: an LLM-supervised turn re-decides after every hop.
+        if router == "llm":
+            decision = _llm_route(state, visited)
+            if decision and decision not in visited:
+                return Command(goto=_target(decision))
+            return Command(goto=END)
+
+        return Command(goto=_target(_next_hop(pipeline, visited)))
 
     def analyst_node(state: HybridAgentState) -> dict[str, Any]:
         model = _get_llm()
@@ -625,14 +713,6 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
             visited.append("planner")
         return {"messages": new_msgs, "visited_agents": visited}
 
-    def route_from_supervisor(
-        state: HybridAgentState,
-    ) -> Literal["analyst", "researcher", "planner", "__end__"]:
-        nxt = state.get("next_agent", "FINISH")
-        if nxt in ("analyst", "researcher", "planner"):
-            return nxt  # type: ignore[return-value]
-        return "__end__"
-
     workflow = StateGraph(HybridAgentState)
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("analyst", analyst_node)
@@ -640,16 +720,8 @@ def build_hybrid_training_graph(llm: BaseChatModel | None = None):
     workflow.add_node("planner", planner_node)
 
     workflow.add_edge(START, "supervisor")
-    workflow.add_conditional_edges(
-        "supervisor",
-        route_from_supervisor,
-        {
-            "analyst": "analyst",
-            "researcher": "researcher",
-            "planner": "planner",
-            "__end__": END,
-        },
-    )
+    # The supervisor routes per step via `Command(goto=...)` (Tier 3), so there are no
+    # conditional edges from it; each sub-agent returns to the supervisor to continue.
     workflow.add_edge("analyst", "supervisor")
     workflow.add_edge("researcher", "supervisor")
     workflow.add_edge("planner", "supervisor")

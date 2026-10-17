@@ -29,6 +29,14 @@
 └───────────────────────┘  └──────────────────────┘  └─────────────────────────┘
 ```
 
+### Routing: Three Tiers
+The supervisor decides who runs, in three tiers:
+1. **Tier 1 — deterministic heuristic** (`classify_intent`, zero latency). Used when intent is explicit: a plan keyword (*plan, schedule, program, mesocycle, periodize, prescribe, upload*) or an action verb (*create, move, save, delete, apply, …*) aimed at a workout/training noun; a data/quantity question (*how many, what's my, when did I, km, weekly, summary*); or an evidence request (*pubmed, citations, science, why*). This keeps the common cases instant and testable.
+2. **Tier 2 — structured-output LLM supervisor**. Consulted **only** when Tier 1 finds no signal (e.g. short follow-ups like "sounds good, go ahead"). It returns one decision (`analyst` / `researcher` / `planner` / `FINISH`) via `with_structured_output(RouteDecision)`. Set `KINESIS_ROUTER_MODEL` to route with a cheaper model; if the call fails, the heuristic plan is used as a fallback.
+3. **Tier 3 — per-step `Command` loop**. The supervisor is a real loop: it returns a LangGraph `Command(goto=…)` for **one hop at a time** (rather than a fixed analyst→researcher→planner list), re-deciding after every sub-agent, so it can stop early, skip an agent, or follow up before finishing.
+
+Routing regressions are guarded by a labelled eval set (`tests/routing_eval_cases.json`) asserting the Tier-1 heuristic, plus unit tests for the Tier-2 router and its fallback.
+
 ### Performance Analysis (Analyst, read-only)
 Pure data questions — e.g. `"how many kms did I run this week"`, `"what's my weekly volume"`, `"how did I execute my last run"` — route to the **analyst only** and never invoke the planner. Planning requires explicit intent (a plan keyword, or an action verb such as *create/move/save/delete* aimed at a workout/training noun).
 

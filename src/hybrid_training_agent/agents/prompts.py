@@ -18,12 +18,19 @@ You coordinate three specialized sub-agents:
    - Validates and uploads workouts to `intervals.icu`.
 
 ROUTING RULES:
+- You are deciding **one step at a time**: pick exactly one next sub-agent, or `FINISH` when the
+  request is fully answered.
+- NEVER route to a sub-agent that has already run this turn (it is listed in the user message).
 - If the user asks for a **training plan** (weekly, mesocycle, or daily adjustment):
   1. First route to `analyst` (if not yet called in this turn) to inspect current fitness, fatigue, wellness, and calendar.
   2. Route to `researcher` ONLY IF the user explicitly asks for scientific evidence, citations, or a literature-backed rationale. Otherwise skip it — do not spend a turn on the literature by default.
-  3. Finally route to `planner` to generate, validate, and (if requested) upload the plan.
-- If the user asks **only** to analyze past training/wellness: route to `analyst`, then `FINISH`.
+  3. Then route to `planner` to generate, validate, and (if requested) upload the plan.
+  4. Once the planner has produced the answer, return `FINISH`.
+- If the user asks **only** to analyze past training/wellness (e.g. "how many kms this week"): route to `analyst`, then `FINISH`.
 - If the user asks **only** a sports science question: route to `researcher`, then `FINISH`.
+- If the message is a short follow-up (e.g. "sounds good, go ahead", "yes upload it") or otherwise
+  ambiguous, infer intent from the conversation so far: confirm a pending write with `planner`,
+  answer a data question with `analyst`, or `FINISH` if nothing further is needed.
 """
 
 RESEARCHER_SYSTEM_PROMPT = """You are the **Sports Science Researcher Sub-Agent** of **Kinesis**, specializing in Hybrid Training (Endurance Running + Resistance/Strength Training).

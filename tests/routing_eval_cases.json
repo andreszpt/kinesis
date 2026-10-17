@@ -1,0 +1,32 @@
+[
+  {"prompt": "Build me a 7-day hybrid running and strength plan", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "create a 60m full body strength training for tomorrow", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "plan my next week of training", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "move my Thursday run to Friday", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "delete the workout on Friday", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "save this workout to my library", "expected_pipeline": ["analyst", "planner"]},
+  {"prompt": "create a 7-day plan backed by scientific evidence", "expected_pipeline": ["analyst", "researcher", "planner"]},
+  {"prompt": "build me a plan with citations from the literature", "expected_pipeline": ["analyst", "researcher", "planner"]},
+
+  {"prompt": "how many kms did I run this week", "expected_pipeline": ["analyst"]},
+  {"prompt": "how many workouts did I do this week", "expected_pipeline": ["analyst"]},
+  {"prompt": "what's my weekly volume", "expected_pipeline": ["analyst"]},
+  {"prompt": "what was my CTL and ATL last week", "expected_pipeline": ["analyst"]},
+  {"prompt": "analyze my last 28 days on intervals.icu", "expected_pipeline": ["analyst"]},
+  {"prompt": "how is my HRV and readiness looking", "expected_pipeline": ["analyst"]},
+  {"prompt": "when did I last run 5x1km at threshold pace", "expected_pipeline": ["analyst"]},
+  {"prompt": "how did I execute my last session", "expected_pipeline": ["analyst"]},
+  {"prompt": "show me my best efforts", "expected_pipeline": ["analyst"]},
+  {"prompt": "what's my training plan?", "expected_pipeline": ["analyst"]},
+
+  {"prompt": "What does PubMed say about the interference effect?", "expected_pipeline": ["researcher"]},
+  {"prompt": "is there evidence about polarized training", "expected_pipeline": ["researcher"]},
+  {"prompt": "what does the science say about concurrent training", "expected_pipeline": ["researcher"]},
+
+  {"prompt": "analyze my data and cite the literature on interference", "expected_pipeline": ["analyst", "researcher"]},
+
+  {"prompt": "ok do that", "confident": false},
+  {"prompt": "sounds good, go ahead", "confident": false},
+  {"prompt": "hmm not sure", "confident": false},
+  {"prompt": "yes please", "confident": false}
+]
