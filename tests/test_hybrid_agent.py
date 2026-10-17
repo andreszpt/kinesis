@@ -419,6 +419,23 @@ def test_ask_cmd_is_silent_when_not_a_tty(monkeypatch: pytest.MonkeyPatch) -> No
     assert len(list(fake_llm.messages)) == 0
 
 
+def test_subagent_scope_boundaries_keep_uploads_in_the_planner() -> None:
+    from hybrid_training_agent.agents.prompts import (
+        ANALYST_SYSTEM_PROMPT,
+        PLANNER_SYSTEM_PROMPT,
+        RESEARCHER_SYSTEM_PROMPT,
+    )
+
+    for prompt in (ANALYST_SYSTEM_PROMPT, RESEARCHER_SYSTEM_PROMPT):
+        lower = prompt.lower()
+        assert "scope & boundaries" in lower
+        assert "never mention uploads" in lower
+        assert "planner" in lower
+
+    # The planner remains the only sub-agent wired to actually upload.
+    assert "upload_training_plan_to_intervals" in PLANNER_SYSTEM_PROMPT
+
+
 def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENCODE_GO_API_KEY", "test_go_key")
     monkeypatch.setenv("LLM_PROVIDER", "opencode-go")
