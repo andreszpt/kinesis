@@ -30,6 +30,8 @@
 ```
 
 ### Performance Analysis (Analyst, read-only)
+Pure data questions — e.g. `"how many kms did I run this week"`, `"what's my weekly volume"`, `"how did I execute my last run"` — route to the **analyst only** and never invoke the planner. Planning requires explicit intent (a plan keyword, or an action verb such as *create/move/save/delete* aimed at a workout/training noun).
+
 Beyond the pre-fetched load/wellness snapshot, the analyst can drill into the athlete's data when the request is analysis-style (`analyze`, `compare`, `how did`, `PB`, `when did I last`, …):
 - **`get_performance_curves`** — best pace/HR curves (`42d`, `1y`, `all`, season) for threshold calibration and race potential.
 - **`analyze_activity_execution`** — detected intervals/reps (duration, distance, avg pace/HR/power, intensity) plus a compact stream summary (averages, bests, first/second-half drift).

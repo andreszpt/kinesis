@@ -276,6 +276,14 @@ def test_langgraph_multi_agent_pipeline_execution() -> None:
     assert classify_intent_pipeline("Analyze my HRV and CTL from intervals.icu") == [
         "analyst"
     ]
+    # Data questions about the week must not trigger the planner.
+    assert classify_intent_pipeline("how many kms did I run this week") == ["analyst"]
+    assert classify_intent_pipeline("how many workouts did I do this week") == ["analyst"]
+    assert classify_intent_pipeline("what's my training plan?") == ["analyst"]
+    # ...but explicit creation still plans.
+    assert classify_intent_pipeline(
+        "create a 60m full body strength training for tomorrow"
+    ) == ["analyst", "planner"]
 
     class ToolEnabledFakeChatModel(GenericFakeChatModel):
         def bind_tools(self, tools: Any, **kwargs: Any) -> Any:

@@ -335,11 +335,145 @@ def _select_planner_tools(user_text: str) -> list[BaseTool]:
     return tools
 
 
+# Intent keywords. `week`/`workout`/`run` are deliberately NOT plan triggers on their own:
+# "how many kms did I run this week" is a data question, not a planning request.
+_PLAN_KEYWORDS = (
+    "plan",
+    "schedule",
+    "program",
+    "mesocycle",
+    "microcycle",
+    "periodiz",
+    "prescribe",
+    "upload",
+    "training block",
+)
+_PLAN_ACTION_VERBS = (
+    "create",
+    "make",
+    "build",
+    "design",
+    "write",
+    "generate",
+    "prepare",
+    "draft",
+    "give me",
+    "set up",
+    "put together",
+    "add to",
+    "put on",
+    "move",
+    "reschedule",
+    "shift",
+    "postpone",
+    "rename",
+    "edit",
+    "update",
+    "change",
+    "swap",
+    "delete",
+    "remove",
+    "cancel",
+    "save",
+    "apply",
+)
+_PLAN_SUBJECT_NOUNS = (
+    "workout",
+    "session",
+    "training",
+    "run",
+    "runs",
+    "ride",
+    "strength",
+    "interval",
+    "tempo",
+    "fartlek",
+    "long run",
+    "easy run",
+    "recovery run",
+    "hybrid",
+    "block",
+)
+_QUESTION_MARKERS = (
+    "how many",
+    "how much",
+    "how far",
+    "how long",
+    "how often",
+    "what was",
+    "what's my",
+    "whats my",
+    "what is my",
+    "what are my",
+    "did i",
+    "have i",
+    "when did",
+    "when was",
+    "show me",
+    "tell me",
+    "summary",
+    "stats",
+)
+_EVIDENCE_KEYWORDS = (
+    "science",
+    "scientific",
+    "evidence",
+    "citation",
+    "citations",
+    "cite",
+    "literature",
+    "peer-reviewed",
+    "study",
+    "studies",
+    "paper",
+    "pubmed",
+    "pmid",
+    "doi",
+    "meta-analysis",
+    "interference",
+    "hypertrophy",
+    "economy",
+    "polarized",
+    "why",
+    "research",
+)
+_ANALYSIS_KEYWORDS = (
+    "analy",
+    "wellness",
+    "hrv",
+    "ctl",
+    "atl",
+    "tsb",
+    "fatigue",
+    "recovery",
+    "readiness",
+    "past",
+    "history",
+    "suunto",
+    "log",
+    "rpe",
+    "efficiency",
+    "data",
+    "km",
+    "kms",
+    "kilomet",
+    "mile",
+    "weekly",
+    "this week",
+    "last week",
+    "summary",
+    "stats",
+    *_QUESTION_MARKERS,
+)
+
+
 def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
     """Determine the optimal ordered sequence of specialist sub-agents for a user request.
 
-    The literature sub-agent is only added when the user explicitly asks for scientific
-    evidence/citations, so routine plan requests stay fast and free of citation dumps.
+    Planning requires explicit planning intent (a plan keyword, or an action verb aimed at a
+    workout/training noun) so that data questions like "how many kms did I run this week" go
+    to the analyst only. The literature sub-agent is only added when the user explicitly asks
+    for scientific evidence/citations.
     """
     if mode == "research":
         return ["researcher"]
@@ -347,68 +481,17 @@ def classify_intent_pipeline(user_text: str, mode: str = "auto") -> list[str]:
         return ["analyst"]
 
     lower = user_text.lower()
-    wants_plan = mode == "plan" or any(
-        kw in lower
-        for kw in (
-            "plan",
-            "schedule",
-            "program",
-            "week",
-            "mesocycle",
-            "microcycle",
-            "workout",
-            "upload",
-            "calendar",
-            "prescribe",
-        )
+    is_question = any(marker in lower for marker in _QUESTION_MARKERS)
+    has_plan_action = any(verb in lower for verb in _PLAN_ACTION_VERBS)
+    wants_plan = mode == "plan" or any(kw in lower for kw in _PLAN_KEYWORDS) or (
+        has_plan_action and any(noun in lower for noun in _PLAN_SUBJECT_NOUNS)
     )
-    wants_evidence = any(
-        kw in lower
-        for kw in (
-            "science",
-            "scientific",
-            "evidence",
-            "citation",
-            "citations",
-            "cite",
-            "literature",
-            "peer-reviewed",
-            "study",
-            "studies",
-            "paper",
-            "pubmed",
-            "pmid",
-            "doi",
-            "meta-analysis",
-            "interference",
-            "hypertrophy",
-            "economy",
-            "polarized",
-            "why",
-            "research",
-        )
-    )
-    wants_analysis = any(
-        kw in lower
-        for kw in (
-            "analy",
-            "wellness",
-            "hrv",
-            "ctl",
-            "atl",
-            "tsb",
-            "fatigue",
-            "recovery",
-            "readiness",
-            "past",
-            "history",
-            "suunto",
-            "log",
-            "rpe",
-            "efficiency",
-            "data",
-        )
-    )
+    # A pure question ("what's my training plan?") is answered from data, not turned into a plan.
+    if wants_plan and is_question and not has_plan_action:
+        wants_plan = False
+
+    wants_evidence = any(kw in lower for kw in _EVIDENCE_KEYWORDS)
+    wants_analysis = any(kw in lower for kw in _ANALYSIS_KEYWORDS)
 
     if wants_plan:
         # Planning always inspects the athlete's data, but the literature sub-agent is
