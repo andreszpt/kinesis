@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+import pytest
+import respx
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+
+from hybrid_training_agent.agents.graph import (
+    build_hybrid_training_graph,
+    classify_intent_pipeline,
+)
+from hybrid_training_agent.clients.intervals_client import (
+    IntervalsIcuClient,
+    validate_intervals_run_syntax,
+)
+from hybrid_training_agent.clients.science_client import ScienceLiteratureClient
+from hybrid_training_agent.config import Settings, get_chat_model
+from hybrid_training_agent.models import PlannedWorkoutInput
+from hybrid_training_agent.tools.analytics_tools import compute_hybrid_analytics
+from hybrid_training_agent.tools.planner_tools import audit_planned_workouts
+
+
+def test_validate_intervals_run_syntax_valid_and_invalid() -> None:
+    valid_desc = (
+        "Warmup\n"
+        "- 15m 65-75% Pace\n\n"
+        "Main Set 5x\n"
+        "- 1km 98-102% Pace\n"
+        "- 2m 60-70% Pace\n\n"
+        "Cooldown\n"
+        "- 10m 65-75% Pace"
+    )
+    res = validate_intervals_run_syntax(valid_desc)
+    assert res["is_valid_structured_workout"] is True
+    assert res["valid_duration_steps"] == 4
+    assert res["steps_with_intensity_targets"] == 4
+    assert res["issues"] == []
+
+    invalid_desc = "Go for a 45 minute easy run around the park."
+    bad_res = validate_intervals_run_syntax(invalid_desc)
+    assert bad_res["is_valid_structured_workout"] is False
+    assert len(bad_res["issues"]) > 0
+
+
+def test_pubmed_xml_parsing_and_curated_evidence() -> None:
+    sample_xml = """<?xml version="1.0" ?>
+    <PubmedArticleSet>
+      <PubmedArticle>
+        <MedlineCitation>
+          <PMID>34757594</PMID>
+          <Article>
+            <Journal>
+              <Title>Sports Medicine</Title>
+              <JournalIssue>
+                <PubDate><Year>2022</Year></PubDate>
+              </JournalIssue>
+            </Journal>
+            <ArticleTitle>Compatibility of Concurrent Aerobic and Strength Training</ArticleTitle>
+            <Abstract>
+              <AbstractText Label="RESULTS">Concurrent training did not attenuate maximal strength.</AbstractText>
+            </Abstract>
+            <AuthorList>
+              <Author><LastName>Schumann</LastName><Initials>M</Initials></Author>
+              <Author><LastName>Lundberg</LastName><Initials>TR</Initials></Author>
+            </AuthorList>
+            <PublicationTypeList>
+              <PublicationType>Meta-Analysis</PublicationType>
+            </PublicationTypeList>
+          </Article>
+        </MedlineCitation>
+        <PubmedData>
+          <ArticleIdList>
+            <ArticleId IdType="doi">10.1007/s40279-021-01587-7</ArticleId>
+          </ArticleIdList>
+        </PubmedData>
+      </PubmedArticle>
+    </PubmedArticleSet>
+    """
+    parsed = ScienceLiteratureClient._parse_pubmed_xml(sample_xml)
+    assert len(parsed) == 1
+    assert parsed[0]["pmid"] == "34757594"
+    assert parsed[0]["doi"] == "10.1007/s40279-021-01587-7"
+    assert "Schumann M" in parsed[0]["authors"]
+    assert "Meta-Analysis" in parsed[0]["publication_types"]
+
+    curated = ScienceLiteratureClient.get_curated_evidence("concurrent_interference")
+    assert "concurrent_interference" in curated
+    assert any(c["pmid"] == "34757594" for c in curated["concurrent_interference"])
+
+
+def test_compute_hybrid_analytics_and_interference() -> None:
+    wellness = [
+        {"id": "2026-10-11", "ctl": 50.0, "atl": 55.0, "hrv": 68.0, "restingHR": 48, "sleepSecs": 28800},
+        {"id": "2026-10-12", "ctl": 51.0, "atl": 56.0, "hrv": 70.0, "restingHR": 47, "sleepSecs": 27000},
+        {"id": "2026-10-13", "ctl": 52.0, "atl": 58.0, "hrv": 66.0, "restingHR": 49, "sleepSecs": 28000},
+        {"id": "2026-10-14", "ctl": 53.0, "atl": 60.0, "hrv": 69.0, "restingHR": 48, "sleepSecs": 29000},
+    ]
+    activities = [
+        {
+            "id": "run1",
+            "type": "Run",
+            "name": "Easy Aerobic Run",
+            "start_date_local": "2026-10-13T08:00:00",
+            "distance": 10000.0,
+            "moving_time": 3000,
+            "average_speed": 3.33,
+            "average_heartrate": 140,
+            "icu_training_load": 58,
+            "icu_pace_zone_times": [1200, 1500, 200, 100, 0, 0, 0],
+        },
+        {
+            "id": "suunto_str1",
+            "type": "WeightTraining",
+            "name": "Strength Training",
+            "start_date_local": "2026-10-13T11:00:00",  # Only 3h after the run!
+            "moving_time": 3300,
+            "average_heartrate": 118,
+            "icu_training_load": 25,
+        },
+    ]
+
+    report = compute_hybrid_analytics(
+        wellness_records=wellness,
+        activities=activities,
+        days_back=7,
+    )
+
+    assert report["load_and_form"]["ctl_fitness"] == 53.0
+    assert report["load_and_form"]["atl_fatigue"] == 60.0
+    assert report["load_and_form"]["tsb_form"] == -7.0
+    assert report["load_and_form"]["acwr_ratio"] == round(60.0 / 53.0, 2)
+    assert report["running_summary"]["intensity_distribution_3_zone"]["zone_1_2_low_pct"] == 90.0
+    assert report["strength_summary"]["total_sessions"] == 1
+    assert report["concurrent_interference_audit"]["warnings_count"] == 1
+    assert "3.0h apart" in report["concurrent_interference_audit"]["warnings"][0]
+
+
+def test_audit_planned_workouts_and_bulk_upload() -> None:
+    workouts = [
+        PlannedWorkoutInput(
+            date="2026-10-19",
+            name="Heavy Neural Lower Body Strength",
+            sport_type="WeightTraining",
+            description="Back Squat 4x5, RDL 3x6, Calf Raises 3x10",
+            moving_time_minutes=50,
+            estimated_load=55,
+        ),
+        PlannedWorkoutInput(
+            date="2026-10-20",
+            name="VO2max Track Intervals",
+            sport_type="Run",
+            description="Warmup\n- 15m 65-75% Pace\n\nMain Set 5x\n- 1km 102-106% Pace\n- 2m 60-70% Pace\n\nCooldown\n- 10m 65-75% Pace",
+            moving_time_minutes=50,
+            estimated_load=72,
+        ),
+    ]
+    audit = audit_planned_workouts(workouts)
+    assert audit["all_workouts_valid"] is True
+    assert len(audit["interference_audit_warnings"]) == 1
+    assert "Sequential Interference Caution" in audit["interference_audit_warnings"][0]
+
+    settings = Settings(intervals_api_key="test_secret", intervals_athlete_id="0")
+    client = IntervalsIcuClient(settings=settings)
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        post_route = respx_mock.post("/athlete/0/events/bulk").mock(
+            return_value=httpx.Response(200, json=[{"id": 101}, {"id": 102}])
+        )
+        uploaded = client.create_events_bulk(workouts, upsert=True)
+        assert post_route.called
+        assert len(uploaded) == 2
+
+
+def test_langgraph_multi_agent_pipeline_execution() -> None:
+    assert classify_intent_pipeline("Build me a 7-day hybrid running and strength plan") == [
+        "analyst",
+        "researcher",
+        "planner",
+    ]
+    assert classify_intent_pipeline("What does PubMed say about the interference effect?") == [
+        "researcher"
+    ]
+    assert classify_intent_pipeline("Analyze my HRV and CTL from intervals.icu") == [
+        "analyst"
+    ]
+
+    class ToolEnabledFakeChatModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return self
+
+    fake_llm = ToolEnabledFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Analyst Report: CTL is 54, ATL is 50, TSB is +4, HRV is stable."),
+                AIMessage(
+                    content="Researcher Report: Schumann et al. (2022, PMID: 34757594) and Blagrove et al. (2018, PMID: 29249083) support 2 heavy strength sessions/wk spaced >6-24h from key runs."
+                ),
+                AIMessage(
+                    content="Coach Plan: Here is your 7-day polarized running + neural strength plan formatted for intervals.icu and Suunto."
+                ),
+            ]
+        )
+    )
+
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    state_out: dict[str, Any] = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content="Create a comprehensive weekly hybrid training plan for me")
+            ],
+            "next_agent": "supervisor",
+            "visited_agents": [],
+            "mode": "plan",
+        }
+    )
+
+    assert state_out["visited_agents"] == ["analyst", "researcher", "planner"]
+    ai_messages = [m for m in state_out["messages"] if isinstance(m, AIMessage)]
+    assert len(ai_messages) == 3
+    assert ai_messages[0].name == "Performance_and_Health_Analyst"
+    assert ai_messages[1].name == "Sports_Science_Researcher"
+    assert ai_messages[2].name == "Hybrid_Coach_Planner"
+
+
+def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "test_go_key")
+    monkeypatch.setenv("LLM_PROVIDER", "opencode-go")
+
+    # 1. Chat completions model (e.g. kimi-k3)
+    m_chat = get_chat_model(provider="opencode-go", model="opencode-go/kimi-k3")
+    assert getattr(m_chat, "model_name", None) == "kimi-k3"
+    assert getattr(m_chat, "openai_api_base", None) == "https://opencode.ai/inference/go/openai/v1"
+    assert not getattr(m_chat, "use_responses_api", False)
+
+    # 2. Responses API model (e.g. gpt-6-luna)
+    m_resp = get_chat_model(provider="opencode-go", model="gpt-6-luna")
+    assert getattr(m_resp, "model_name", None) == "gpt-6-luna"
+    assert getattr(m_resp, "use_responses_api", False) is True
+
+    # 3. Anthropic Messages API model (e.g. qwen3.8-max)
+    m_anth = get_chat_model(provider="opencode-go", model="qwen3.8-max")
+    assert getattr(m_anth, "model", None) == "qwen3.8-max"
+    assert getattr(m_anth, "anthropic_api_url", None) == "https://opencode.ai/inference/go/anthropic"
+
