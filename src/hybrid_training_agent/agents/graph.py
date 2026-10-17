@@ -5,7 +5,6 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -91,19 +90,6 @@ _ANALYST_DEEP_KEYWORDS = (
     "how did",
     "session review",
     "interval analysis",
-    "each month",
-    "every month",
-    "month by month",
-    "month-by-month",
-    "monthly",
-    "per month",
-    "from 20",
-    "since 20",
-    "this year",
-    "year to date",
-    "year-to-date",
-    "ytd",
-    "breakdown",
 )
 
 
@@ -323,75 +309,12 @@ def _latest_user_text(messages: list[AnyMessage]) -> str:
     return ""
 
 
-_MONTH_NUMBERS = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
-    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-_UNIT_DAYS = {
-    "d": 1, "day": 1, "days": 1,
-    "w": 7, "week": 7, "weeks": 7,
-    "mo": 30, "month": 30, "months": 30,
-    "y": 365, "year": 365, "years": 365,
-}
-_MAX_WINDOW_DAYS = 3650
-
-
-def _days_since(start: date) -> int:
-    return max(7, min((date.today() - start).days + 1, _MAX_WINDOW_DAYS))
-
-
 def _detect_days_back(user_text: str, default: int = 28) -> int:
-    """Resolve the history window a request needs (in days).
-
-    Handles explicit spans ("last 60 days", "past 3 months"), year references
-    ("from 2026", "this year"), and month references ("since May"), so questions like
-    "how many kms did I run each month from 2026" pre-fetch the whole period instead of
-    the default 28 days.
-    """
-    lower = user_text.lower()
-
-    span = re.search(
-        r"(?:last|past|previous|trailing|final)\s+(\d+)\s*"
-        r"(d|day|days|w|week|weeks|mo|month|months|y|year|years)\b",
-        lower,
-    )
-    if span:
-        return max(7, min(int(span.group(1)) * _UNIT_DAYS[span.group(2)], _MAX_WINDOW_DAYS))
-
-    year_match = re.search(r"\b(?:from|since|in|during)\s+(20\d{2})\b", lower) or re.search(
-        r"\b(20\d{2})\b", lower
-    )
-    if year_match:
-        return _days_since(date(int(year_match.group(1)), 1, 1))
-
-    if any(
-        kw in lower
-        for kw in (
-            "this year",
-            "year to date",
-            "year-to-date",
-            "ytd",
-            "each month",
-            "every month",
-            "month by month",
-            "month-by-month",
-            "monthly",
-            "per month",
-        )
-    ):
-        return _days_since(date(date.today().year, 1, 1))
-
-    month_match = re.search(r"(?:from|since)\s+([a-z]{3,9})", lower)
-    if month_match and month_match.group(1) in _MONTH_NUMBERS:
-        month = _MONTH_NUMBERS[month_match.group(1)]
-        start = date(date.today().year, month, 1)
-        if start > date.today():
-            start = date(date.today().year - 1, month, 1)
-        return _days_since(start)
-
-    return default
+    """Honor an explicit window such as 'last 60 days' when prefetching analyst data."""
+    match = re.search(r"(?:last|past|previous)\s+(\d+)\s*(?:days?|d)\b", user_text, re.IGNORECASE)
+    if not match:
+        return default
+    return max(7, min(int(match.group(1)), 365))
 
 
 def _select_analyst_tools(user_text: str) -> list[BaseTool]:

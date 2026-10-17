@@ -286,62 +286,7 @@ def compute_hybrid_analytics(
             "warnings_count": len(interference_warnings),
             "warnings": interference_warnings,
         },
-        # Calendar-month buckets so month-by-month questions ("how many kms each month
-        # from 2026") can be answered from the pre-fetched window without estimating.
-        "monthly_summary": compute_monthly_totals(activities),
     }
-
-
-_RUN_TYPES = ("Run", "TrailRun", "VirtualRun", "Treadmill")
-_STRENGTH_TYPES = ("WeightTraining", "Strength", "Crossfit", "Workout")
-
-
-def compute_monthly_totals(
-    activities: list[dict[str, Any]], sport: str = "Run"
-) -> list[dict[str, Any]]:
-    """Group activities into ascending calendar-month buckets.
-
-    `sport` filters which activities are counted: 'Run', 'WeightTraining', or 'all'.
-    Distances are summed exactly from the raw activity records (no estimation).
-    """
-    buckets: dict[str, dict[str, Any]] = {}
-    for act in activities:
-        act_type = str(act.get("type") or "").strip()
-        if sport == "Run" and act_type not in _RUN_TYPES:
-            continue
-        if sport == "WeightTraining" and act_type not in _STRENGTH_TYPES:
-            continue
-
-        month = str(act.get("start_date_local") or "")[:7]
-        if len(month) != 7:
-            continue
-        bucket = buckets.setdefault(
-            month,
-            {
-                "month": month,
-                "sessions": 0,
-                "distance_km": 0.0,
-                "duration_hours": 0.0,
-                "training_load": 0.0,
-            },
-        )
-        moving_time_s = float(act.get("moving_time") or act.get("elapsed_time") or 0.0)
-        bucket["sessions"] += 1
-        bucket["distance_km"] += float(act.get("distance") or 0.0) / 1000.0
-        bucket["duration_hours"] += moving_time_s / 3600.0
-        bucket["training_load"] += float(act.get("icu_training_load") or 0.0)
-
-    return [
-        {
-            "month": bucket["month"],
-            "sessions": bucket["sessions"],
-            "distance_km": round(bucket["distance_km"], 1),
-            "duration_hours": round(bucket["duration_hours"], 2),
-            "training_load": round(bucket["training_load"], 1),
-        }
-        for _, bucket in sorted(buckets.items())
-    ]
-
 
 
 @tool
@@ -665,32 +610,6 @@ def get_activity_best_efforts(
         return {"error": str(exc)}
 
 
-@tool
-def get_monthly_training_summary(
-    start_date: str, end_date: str, sport: str = "Run"
-) -> dict[str, Any]:
-    """Per-calendar-month totals (sessions, distance km, hours, load) between two dates.
-
-    Use this for month-by-month or year-to-date volume questions such as
-    "how many kms did I run each month from 2026". Dates are YYYY-MM-DD. `sport` is
-    'Run', 'WeightTraining', or 'all'. Numbers come straight from the activity records.
-    """
-    client = IntervalsIcuClient()
-    try:
-        activities = client.get_activities(oldest=start_date, newest=end_date)
-    except IntervalsIcuError as exc:
-        return {"error": str(exc)}
-    months = compute_monthly_totals(activities, sport=sport)
-    return {
-        "start_date": start_date,
-        "end_date": end_date,
-        "sport": sport,
-        "months": months,
-        "total_distance_km": round(sum(m["distance_km"] for m in months), 1),
-        "total_sessions": sum(m["sessions"] for m in months),
-    }
-
-
 PERFORMANCE_ANALYSIS_TOOLS = [
     get_performance_curves,
     search_completed_activities,
@@ -698,5 +617,4 @@ PERFORMANCE_ANALYSIS_TOOLS = [
     analyze_activity_execution,
     get_activity_interval_stats,
     get_activity_best_efforts,
-    get_monthly_training_summary,
 ]
