@@ -23,6 +23,16 @@ _OPENCODE_GO_RESPONSES_PREFIXES = ("gpt-", "grok-", "muse-spark-")
 _OPENCODE_GO_GEMINI_PREFIXES = ("gemini-",)
 
 
+def _parse_optional_temperature() -> float | None:
+    raw = os.getenv("LLM_TEMPERATURE", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 @dataclass
 class Settings:
     """Configuration settings for Kinesis (Hybrid Training Agent)."""
@@ -45,9 +55,7 @@ class Settings:
     llm_model: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL", "").strip()
     )
-    llm_temperature: float = field(
-        default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.2"))
-    )
+    llm_temperature: float | None = field(default_factory=_parse_optional_temperature)
 
     opencode_go_api_key: str = field(
         default_factory=lambda: (
@@ -110,7 +118,7 @@ def get_settings() -> Settings:
 def _build_opencode_go_chat_model(
     settings: Settings,
     model: str | None,
-    temperature: float,
+    temperature: float | None,
     **kwargs: Any,
 ) -> BaseChatModel:
     """Instantiate a LangChain ChatModel routed to the appropriate OpenCode Go inference endpoint."""
@@ -133,9 +141,10 @@ def _build_opencode_go_chat_model(
     if clean_model.startswith(_OPENCODE_GO_ANTHROPIC_PREFIXES):
         from langchain_anthropic import ChatAnthropic
 
+        # Note: Anthropic Messages models on OpenCode Go (Claude Haiku 5.5, Qwen3.8, MiniMax M3)
+        # deprecate/reject `temperature`, so we omit `temperature` here.
         return ChatAnthropic(
             model=clean_model,
-            temperature=temperature,
             api_key=api_key,
             anthropic_api_url=f"{base_url}/anthropic",
             default_headers=go_headers,
@@ -145,9 +154,9 @@ def _build_opencode_go_chat_model(
     if clean_model.startswith(_OPENCODE_GO_RESPONSES_PREFIXES):
         from langchain_openai import ChatOpenAI
 
+        # Responses API models (GPT-6 Luna, Grok 4.7, Muse Spark) also omit temperature by default
         return ChatOpenAI(
             model=clean_model,
-            temperature=temperature,
             api_key=api_key,
             base_url=f"{base_url}/openai/v1",
             use_responses_api=True,
@@ -158,9 +167,10 @@ def _build_opencode_go_chat_model(
     if clean_model.startswith(_OPENCODE_GO_GEMINI_PREFIXES):
         from langchain_google_genai import ChatGoogleGenerativeAI
 
+        if temperature is not None:
+            kwargs.setdefault("temperature", temperature)
         return ChatGoogleGenerativeAI(
             model=clean_model,
-            temperature=temperature,
             google_api_key=api_key,
             additional_headers=go_headers,
             **kwargs,
@@ -169,9 +179,10 @@ def _build_opencode_go_chat_model(
     # Default OpenCode Go endpoint: OpenAI-compatible Chat Completions (/inference/go/openai/v1/chat/completions)
     from langchain_openai import ChatOpenAI
 
+    if temperature is not None:
+        kwargs.setdefault("temperature", temperature)
     return ChatOpenAI(
         model=clean_model,
-        temperature=temperature,
         api_key=api_key,
         base_url=f"{base_url}/openai/v1",
         default_headers=go_headers,
@@ -202,9 +213,9 @@ def get_chat_model(
         from langchain_anthropic import ChatAnthropic
 
         model_name = model or settings.llm_model or "claude-sonnet-4-20250514"
+        # Newer Anthropic models deprecate `temperature`; only pass if explicitly provided via kwargs
         return ChatAnthropic(
             model=model_name,
-            temperature=resolved_temp,
             api_key=settings.anthropic_api_key or None,
             **kwargs,
         )
@@ -213,9 +224,10 @@ def get_chat_model(
         from langchain_openai import ChatOpenAI
 
         model_name = model or settings.llm_model or "gpt-4o"
+        if resolved_temp is not None:
+            kwargs.setdefault("temperature", resolved_temp)
         return ChatOpenAI(
             model=model_name,
-            temperature=resolved_temp,
             api_key=settings.openai_api_key or None,
             **kwargs,
         )
@@ -224,9 +236,10 @@ def get_chat_model(
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         model_name = model or settings.llm_model or "gemini-2.5-pro"
+        if resolved_temp is not None:
+            kwargs.setdefault("temperature", resolved_temp)
         return ChatGoogleGenerativeAI(
             model=model_name,
-            temperature=resolved_temp,
             google_api_key=settings.google_api_key or None,
             **kwargs,
         )
