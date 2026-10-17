@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import io
 from typing import Any
 
 import httpx
 import pytest
 import respx
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 
 from hybrid_training_agent.agents.graph import (
     build_hybrid_training_graph,
     classify_intent_pipeline,
 )
-from hybrid_training_agent.cli import extract_message_text
+from hybrid_training_agent import cli
+from hybrid_training_agent.cli import _pending_question, extract_message_text
 from hybrid_training_agent.clients.intervals_client import (
     IntervalsIcuClient,
     validate_intervals_run_syntax,
@@ -22,6 +24,13 @@ from hybrid_training_agent.config import Settings, get_chat_model
 from hybrid_training_agent.models import PlannedWorkoutInput
 from hybrid_training_agent.tools.analytics_tools import compute_hybrid_analytics
 from hybrid_training_agent.tools.planner_tools import audit_planned_workouts
+
+
+class _RecordingFakeChatModel(GenericFakeChatModel):
+    """Scripted fake chat model that plays nicely with `bind_tools`."""
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        return self
 
 
 def test_validate_intervals_run_syntax_valid_and_invalid() -> None:
@@ -223,6 +232,126 @@ def test_langgraph_multi_agent_pipeline_execution() -> None:
     assert ai_messages[0].name == "Performance_and_Health_Analyst"
     assert ai_messages[1].name == "Sports_Science_Researcher"
     assert ai_messages[2].name == "Hybrid_Coach_Planner"
+
+
+def test_subagent_requests_never_replay_foreign_thinking_blocks() -> None:
+    """Anthropic rejects thinking signatures created under another conversation's system/tools."""
+    seen_conversations: list[list[AnyMessage]] = []
+
+    class RecordingFakeChatModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return self
+
+        def invoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+            seen_conversations.append(list(input))
+            return super().invoke(input, config=config, **kwargs)
+
+    poisoned_analyst_report = AIMessage(
+        content=[
+            {"type": "thinking", "thinking": "secret reasoning", "signature": "sig-from-analyst"},
+            {"type": "text", "text": "Analyst Report: CTL 54, ATL 50, TSB +4."},
+        ]
+    )
+
+    fake_llm = RecordingFakeChatModel(
+        messages=iter(
+            [
+                poisoned_analyst_report,
+                AIMessage(content="Researcher Report: ok."),
+                AIMessage(content="Coach Plan: ok."),
+            ]
+        )
+    )
+    graph = build_hybrid_training_graph(llm=fake_llm)
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Create a comprehensive hybrid training plan")],
+            "next_agent": "supervisor",
+            "visited_agents": [],
+            "mode": "plan",
+        }
+    )
+
+    assert len(seen_conversations) == 3
+    # The researcher's request is the first one that replays the analyst transcript.
+    researcher_conversation = seen_conversations[1]
+    assert not isinstance(researcher_conversation[-1], AIMessage)
+    for message in researcher_conversation:
+        blocks = message.content if isinstance(message.content, list) else []
+        assert not any(
+            isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+            for b in blocks
+        )
+        assert "sig-from-analyst" not in str(message.content)
+
+    # The briefing keeps the analyst's plain-text conclusion, tagged with its agent name.
+    assert any(
+        isinstance(m, AIMessage) and "Analyst Report: CTL 54" in str(m.content)
+        for m in researcher_conversation
+    )
+    assert any(
+        isinstance(m, AIMessage) and "Performance_and_Health_Analyst" in str(m.content)
+        for m in researcher_conversation
+    )
+
+
+def test_pending_question_detection() -> None:
+    assert _pending_question([HumanMessage(content="hi")]) == ""
+    assert _pending_question(
+        [HumanMessage(content="hi"), AIMessage(content="Here is your plan.")]
+    ) == ""
+    assert _pending_question(
+        [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content=[
+                    {"type": "thinking", "thinking": "should I ask?", "signature": "sig"},
+                    {"type": "text", "text": "Do you want me to upload this to intervals.icu?"},
+                ],
+                name="Hybrid_Coach_Planner",
+            ),
+            HumanMessage(content="yes"),
+            AIMessage(content="Done."),
+        ]
+    ) == ""
+
+
+def test_ask_cmd_offers_follow_up_when_agent_asks_a_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TtyStringIO(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    fake_llm = _RecordingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Should the session be upper or lower body focused?"),
+                AIMessage(content="Planner: here is the 60m full body session."),
+            ]
+        )
+    )
+    monkeypatch.setattr(cli.sys, "stdin", TtyStringIO())
+    monkeypatch.setattr(cli, "build_hybrid_training_graph", lambda: build_hybrid_training_graph(llm=fake_llm))
+
+    replies = iter(["Lower body focus with a full-body finisher."])
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: next(replies))
+
+    cli.ask_cmd(prompt="Create a 60m full body strength session", mode="research")
+
+    # Both fake replies were consumed: the follow-up answer triggered a second graph turn.
+    assert list(fake_llm.messages) == []
+
+
+def test_ask_cmd_is_silent_when_not_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_llm = _RecordingFakeChatModel(
+        messages=iter([AIMessage(content="Should the session be upper or lower body focused?")])
+    )
+    monkeypatch.setattr(cli, "build_hybrid_training_graph", lambda: build_hybrid_training_graph(llm=fake_llm))
+    monkeypatch.setattr(cli.Prompt, "ask", lambda *a, **k: pytest.fail("must not prompt without a TTY"))
+
+    cli.ask_cmd(prompt="Create a 60m full body strength session", mode="research")
+
+    # The initial run consumed the scripted reply and no follow-up turn ran.
+    assert len(list(fake_llm.messages)) == 0
 
 
 def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:

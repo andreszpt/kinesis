@@ -134,6 +134,17 @@ def _render_agent_turn(messages: list[AnyMessage], start_idx: int) -> None:
             )
 
 
+def _pending_question(messages: list[AnyMessage]) -> str:
+    """Return the last assistant answer if it appears to be asking the user a question."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            text = extract_message_text(msg.content).strip()
+            return text if "?" in text else ""
+        if isinstance(msg, HumanMessage):
+            break
+    return ""
+
+
 @app.command("status")
 def status_cmd() -> None:
     """Check configuration, LLM API keys, and Intervals.icu connection status."""
@@ -339,6 +350,51 @@ def ask_cmd(
         final_state = graph.invoke(initial_state)
 
     _render_agent_turn(final_state["messages"], start_idx=1)
+
+    # The agents may end a turn by asking the athlete a clarifying question (e.g. available
+    # equipment, weekly frequency, or whether to upload). Offer a follow-up reply so the
+    # one-shot command does not dead-end. Skipped automatically for non-interactive usage
+    # (pipes, scripts, CI), which keeps stdout clean.
+    if not sys.stdin.isatty():
+        return
+
+    conversation_messages = list(final_state["messages"])
+    pending = _pending_question(conversation_messages)
+    if pending:
+        console.print(
+            "[dim]Kinesis is waiting on your reply. "
+            "Type your answer, or press Enter (or type 'done') to exit.[/dim]"
+        )
+
+    while pending:
+        try:
+            follow_up = Prompt.ask("\n[bold green]You[/bold green]").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Done.[/dim]")
+            break
+
+        if not follow_up or follow_up.lower() in ("done", "exit", "quit", "/quit", "/exit"):
+            break
+
+        conversation_messages.append(HumanMessage(content=follow_up))
+        prev_len = len(conversation_messages)
+        try:
+            with console.status("[bold green]Continuing...[/bold green]"):
+                state_out = graph.invoke(
+                    {
+                        "messages": conversation_messages,
+                        "next_agent": "supervisor",
+                        "visited_agents": [],
+                        "mode": mode,
+                    }
+                )
+        except Exception as exc:
+            console.print(f"[red]Agent Execution Error:[/red] {exc}")
+            break
+
+        conversation_messages = list(state_out["messages"])
+        _render_agent_turn(conversation_messages, start_idx=prev_len)
+        pending = _pending_question(conversation_messages)
 
 
 @app.command("chat")

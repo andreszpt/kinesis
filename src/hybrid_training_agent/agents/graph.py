@@ -47,6 +47,70 @@ class HybridAgentState(TypedDict):
     mode: str
 
 
+_THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
+
+
+def _extract_plain_text(content: Any) -> str:
+    """Flatten a message content payload to plain text, dropping reasoning blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                block_type = block.get("type")
+                if block_type in _THINKING_BLOCK_TYPES or block_type == "tool_use":
+                    continue
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _prepare_subagent_history(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Reduce shared state to a safe, provider-agnostic briefing for a sub-agent.
+
+    Sub-agents run sequentially and each appends its full ReAct transcript (thinking
+    blocks, tool calls, tool results) to the shared state. Replaying that transcript
+    inside the next sub-agent's conversation breaks Anthropic validation: thinking
+    block signatures are bound to the system prompt and tools of the conversation
+    that created them ("Invalid `signature` in `thinking` block. The block is bound
+    to a different conversation"). Consecutive assistant turns are also rejected as
+    unsupported prefill.
+
+    So we keep only the human turns and the plain-text conclusions of prior
+    sub-agents, dropping reasoning/tool traffic, then guarantee the conversation ends
+    with a user turn.
+    """
+    briefing: list[AnyMessage] = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            briefing.append(HumanMessage(content=_extract_plain_text(msg.content)))
+            continue
+        if isinstance(msg, AIMessage):
+            text = _extract_plain_text(msg.content).strip()
+            if not text:
+                continue
+            if msg.name:
+                text = f"{msg.name}:\n{text}"
+            briefing.append(AIMessage(content=text))
+
+    if briefing and isinstance(briefing[-1], AIMessage):
+        briefing.append(
+            HumanMessage(
+                content=(
+                    "Continue from the conversation above. Use the previous "
+                    "sub-agent findings as context and complete your own part of "
+                    "the task now. Call your tools as needed, then give your final answer."
+                )
+            )
+        )
+    return briefing
+
+
 def _run_tool_calling_subagent(
     llm: BaseChatModel,
     system_prompt: str,
@@ -61,7 +125,7 @@ def _run_tool_calling_subagent(
 
     working_messages: list[AnyMessage] = [
         SystemMessage(content=system_prompt),
-        *messages,
+        *_prepare_subagent_history(messages),
     ]
     new_messages: list[AnyMessage] = []
 
