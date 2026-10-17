@@ -170,6 +170,48 @@ def test_compute_hybrid_analytics_and_interference() -> None:
     assert report["strength_summary"]["total_sessions"] == 1
     assert report["concurrent_interference_audit"]["warnings_count"] == 1
     assert "3.0h apart" in report["concurrent_interference_audit"]["warnings"][0]
+    # Month buckets are computed from the raw activities (runs only by default).
+    assert report["monthly_summary"] == [
+        {
+            "month": "2026-10",
+            "sessions": 1,
+            "distance_km": 10.0,
+            "duration_hours": 0.83,
+            "training_load": 58.0,
+        }
+    ]
+
+
+def test_compute_monthly_totals_exact_distances() -> None:
+    from hybrid_training_agent.tools.analytics_tools import compute_monthly_totals
+
+    activities = [
+        {"id": "a1", "type": "Run", "start_date_local": "2026-04-30T08:00:00", "distance": 10000.0, "moving_time": 3000, "icu_training_load": 50},
+        {"id": "a2", "type": "Run", "start_date_local": "2026-05-02T08:00:00", "distance": 21097.5, "moving_time": 6600, "icu_training_load": 90},
+        {"id": "a3", "type": "Run", "start_date_local": "2026-05-15T08:00:00", "distance": 5000.0, "moving_time": 1500, "icu_training_load": 25},
+        {"id": "s1", "type": "WeightTraining", "start_date_local": "2026-05-15T18:00:00", "moving_time": 3600, "icu_training_load": 30},
+        {"id": "a4", "type": "Ride", "start_date_local": "2026-05-20T08:00:00", "distance": 40000.0, "moving_time": 4200},
+    ]
+
+    runs = compute_monthly_totals(activities, sport="Run")
+    assert [m["month"] for m in runs] == ["2026-04", "2026-05"]
+    assert runs[0]["sessions"] == 1 and runs[0]["distance_km"] == 10.0
+    assert runs[1]["sessions"] == 2
+    assert runs[1]["distance_km"] == 26.1  # 21.0975 + 5.0, rounded to 0.1 km
+
+    strength = compute_monthly_totals(activities, sport="WeightTraining")
+    assert strength == [
+        {
+            "month": "2026-05",
+            "sessions": 1,
+            "distance_km": 0.0,
+            "duration_hours": 1.0,
+            "training_load": 30.0,
+        }
+    ]
+
+    everything = compute_monthly_totals(activities, sport="all")
+    assert sum(m["sessions"] for m in everything) == 5
 
 
 def test_audit_planned_workouts_and_bulk_upload() -> None:
@@ -938,6 +980,45 @@ def test_supervisor_falls_back_to_heuristic_when_router_fails() -> None:
     assert router.calls == 1
 
 
+def test_monthly_training_summary_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVALS_ICU_API_KEY", "test_secret")
+    from hybrid_training_agent.tools.analytics_tools import get_monthly_training_summary
+
+    with respx.mock(base_url="https://intervals.icu/api/v1") as respx_mock:
+        activities_route = respx_mock.get("/athlete/0/activities").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"id": "a1", "type": "Run", "start_date_local": "2026-05-02T08:00:00", "distance": 30000.0, "moving_time": 9000, "icu_training_load": 100},
+                    {"id": "a2", "type": "Run", "start_date_local": "2026-05-15T08:00:00", "distance": 70000.0, "moving_time": 21000, "icu_training_load": 200},
+                    {"id": "a3", "type": "Run", "start_date_local": "2026-06-01T08:00:00", "distance": 50000.0, "moving_time": 15000, "icu_training_load": 150},
+                ],
+            )
+        )
+        result = get_monthly_training_summary.invoke(
+            {"start_date": "2026-01-01", "end_date": "2026-12-31"}
+        )
+
+    assert activities_route.called
+    assert result["months"][0] == {
+        "month": "2026-05",
+        "sessions": 2,
+        "distance_km": 100.0,
+        "duration_hours": 8.33,
+        "training_load": 300.0,
+    }
+    assert result["total_distance_km"] == 150.0
+    assert result["total_sessions"] == 3
+
+
+def test_monthly_questions_bind_the_monthly_tool() -> None:
+    tools = {
+        t.name
+        for t in _select_analyst_tools("analyze how many kms did I run each month from 2026")
+    }
+    assert "get_monthly_training_summary" in tools
+
+
 def test_extract_message_text_from_content_blocks() -> None:
     blocks = [
         {"type": "thinking", "thinking": "Internal chain of thought..."},
@@ -1033,9 +1114,23 @@ def test_detect_days_back_from_user_text() -> None:
     assert _detect_days_back("Create a 60m strength session", default=28) == 28
     assert _detect_days_back("Analyze my last 60 days please") == 60
     assert _detect_days_back("review the past 7 days") == 7
-    # Out-of-range windows are clamped to a sane 7..365 range.
+    assert _detect_days_back("past 3 months") == 90
+    # Out-of-range windows are clamped to a sane 7..3650 range.
     assert _detect_days_back("last 2 days") == 7
-    assert _detect_days_back("last 9999 days") == 365
+    assert _detect_days_back("last 9999 days") == 3650
+
+    # Year / month / monthly phrasing expands the history window.
+    from datetime import date
+
+    expected_ytd = (date.today() - date(date.today().year, 1, 1)).days + 1
+    assert _detect_days_back("how many kms did I run each month from 2026") == expected_ytd
+    assert _detect_days_back("what did I do this year") == expected_ytd
+    assert _detect_days_back("monthly volume") == expected_ytd
+    assert _detect_days_back("analyze my volume since 2025") > 250
+    may_start = date(date.today().year, 5, 1)
+    if may_start > date.today():
+        may_start = date(may_start.year - 1, 5, 1)
+    assert _detect_days_back("how far did I run since May") == (date.today() - may_start).days + 1
 
 
 def test_planner_tool_selection_binds_only_what_is_needed() -> None:

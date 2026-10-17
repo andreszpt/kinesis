@@ -45,6 +45,7 @@ Beyond the pre-fetched load/wellness snapshot, the analyst can drill into the at
 - **`analyze_activity_execution`** — detected intervals/reps (duration, distance, avg pace/HR/power, intensity) plus a compact stream summary (averages, bests, first/second-half drift).
 - **`search_similar_interval_sessions`** / **`search_completed_activities`** — find comparable past sessions ("when did I last run 5×1km at this pace?").
 - **`get_activity_interval_stats`** / **`get_activity_best_efforts`** — arbitrary-slice stats and best efforts (duration or distance).
+- **`get_monthly_training_summary`** — exact per-calendar-month totals (sessions, km, hours, load) for a date range; the pre-fetched analysis also exposes a `monthly_summary` array. Requests like *"how many kms each month from 2026"* widen the history window automatically instead of defaulting to 28 days, so monthly figures are exact rather than estimated.
 
 ### Workout Library, Plans & Calendar Edits (Planner)
 - **`get_workout_library`** / **`get_athlete_training_plan`** — inspect saved workouts, folders/plans and the applied plan.
