@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from typing import Any
 
 import typer
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
@@ -19,12 +21,79 @@ from hybrid_training_agent.clients.science_client import ScienceLiteratureClient
 from hybrid_training_agent.config import get_settings
 from hybrid_training_agent.tools.analytics_tools import analyze_training_and_wellness
 
+# Ensure UTF-8 output on Windows terminals so Rich panels, tables, and Markdown render cleanly
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 app = typer.Typer(
     name="kinesis",
     help="Kinesis: Evidence-Based Hybrid Training (Running + Strength) Multi-Agent Coach powered by LangGraph, PubMed, and Intervals.icu.",
     no_args_is_help=False,
 )
 console = Console()
+
+
+def extract_message_text(content: Any) -> str:
+    """Extract clean readable Markdown text from LangChain string or structured content blocks.
+
+    Handles:
+    - Plain strings (`str`)
+    - Anthropic / OpenAI Responses content block lists (`[{"type": "text", "text": "..."}, {"type": "tool_use", ...}]`)
+    - Single dict blocks (`{"type": "text", "text": "..."}`)
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        stripped = content.strip()
+        # If a string was accidentally serialized as JSON content blocks, unpack it
+        if (stripped.startswith("[{") and stripped.endswith("}]")) or (
+            stripped.startswith('{"') and stripped.endswith("}")
+        ):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, (list, dict)):
+                    return extract_message_text(parsed)
+            except Exception:
+                pass
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                if block.strip():
+                    parts.append(block)
+            elif isinstance(block, dict):
+                b_type = str(block.get("type") or "").lower()
+                # Skip tool calls and internal thinking blocks
+                if b_type in ("tool_use", "tool_call", "thinking", "reasoning", "input_json_delta"):
+                    continue
+                if "text" in block and isinstance(block["text"], str) and block["text"].strip():
+                    parts.append(block["text"])
+                elif "content" in block and isinstance(block["content"], str) and block["content"].strip():
+                    parts.append(block["content"])
+        return "\n\n".join(parts)
+
+    if isinstance(content, dict):
+        b_type = str(content.get("type") or "").lower()
+        if b_type in ("tool_use", "tool_call", "thinking", "reasoning"):
+            return ""
+        if "text" in content and isinstance(content["text"], str):
+            return content["text"]
+        if "content" in content and isinstance(content["content"], str):
+            return content["content"]
+        return json.dumps(content, indent=2, ensure_ascii=False)
+
+    return str(content)
 
 
 def _render_agent_turn(messages: list[AnyMessage], start_idx: int) -> None:
@@ -34,14 +103,18 @@ def _render_agent_turn(messages: list[AnyMessage], start_idx: int) -> None:
             console.print(
                 f"  [dim cyan]⚙ Tool completed:[/dim cyan] [bold cyan]{msg.name}[/bold cyan]"
             )
-        elif isinstance(msg, AIMessage) and msg.content:
-            content_str = (
-                msg.content
-                if isinstance(msg.content, str)
-                else json.dumps(msg.content, ensure_ascii=False)
-            )
-            if not content_str.strip():
+        elif isinstance(msg, AIMessage):
+            text = extract_message_text(msg.content).strip()
+            if not text:
                 continue
+
+            # If this AIMessage is an intermediate step that also invokes tools, print a compact status line
+            if getattr(msg, "tool_calls", None):
+                first_line = text.splitlines()[0].strip()
+                if first_line:
+                    console.print(f"  [dim italic]💬 {first_line}[/dim italic]")
+                continue
+
             agent_label = getattr(msg, "name", None) or "Kinesis"
             border = "green"
             if "Researcher" in agent_label:
@@ -53,7 +126,7 @@ def _render_agent_turn(messages: list[AnyMessage], start_idx: int) -> None:
 
             console.print(
                 Panel(
-                    Markdown(content_str),
+                    Markdown(text),
                     title=f"[bold]{agent_label.replace('_', ' ')}[/bold]",
                     border_style=border,
                     padding=(1, 2),

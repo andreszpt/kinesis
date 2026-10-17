@@ -12,6 +12,7 @@ from hybrid_training_agent.agents.graph import (
     build_hybrid_training_graph,
     classify_intent_pipeline,
 )
+from hybrid_training_agent.cli import extract_message_text
 from hybrid_training_agent.clients.intervals_client import (
     IntervalsIcuClient,
     validate_intervals_run_syntax,
@@ -243,4 +244,20 @@ def test_opencode_go_provider_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     m_anth = get_chat_model(provider="opencode-go", model="qwen3.8-max")
     assert getattr(m_anth, "model", None) == "qwen3.8-max"
     assert getattr(m_anth, "anthropic_api_url", None) == "https://opencode.ai/inference/go/anthropic"
+
+
+def test_extract_message_text_from_content_blocks() -> None:
+    blocks = [
+        {"type": "thinking", "thinking": "Internal chain of thought..."},
+        {"type": "text", "text": "### Hybrid Analysis\n- **CTL**: 52.0"},
+        {"type": "tool_use", "id": "call_1", "name": "analyze_training_and_wellness", "input": {}},
+    ]
+    extracted = extract_message_text(blocks)
+    assert extracted == "### Hybrid Analysis\n- **CTL**: 52.0"
+
+    # Also test stringified JSON content blocks
+    import json
+
+    assert extract_message_text(json.dumps(blocks)) == "### Hybrid Analysis\n- **CTL**: 52.0"
+
 
