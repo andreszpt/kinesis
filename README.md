@@ -22,8 +22,8 @@
 │ • CTL / ATL / TSB     │  │ • Europe PMC REST    │  │   Researcher findings   │
 │ • ACWR & Polarization │  │ • Curated Hybrid     │  │ • Running: structured   │
 │ • HRV (7d RMSSD/CV%)  │  │   Meta-Analyses      │  │   syntax for Suunto     │
-│ • Strength & Run      │  │ • Verifiable PMID &  │  │ • Strength: calendar    │
-│   Spacing Audit       │  │   DOI Citations      │  │   note in intervals.icu │
+│ • Strength & Run      │  │ • Verifiable PMID &  │  │ • Strength: structured  │
+│   Spacing Audit       │  │   DOI Citations      │  │   workout (Suunto sync) │
 │ • Pace/HR curves, PBs │  │                      │  │ • Workout library,      │
 │ • Session execution   │  │                      │  │   plans, event edits    │
 └───────────────────────┘  └──────────────────────┘  └─────────────────────────┘
@@ -55,7 +55,7 @@ Beyond the pre-fetched load/wellness snapshot, the analyst can drill into the at
 
 ### How Workouts Are Planned & Synced
 - **Running Workouts (`Run`):** Written in **Intervals.icu Workout Builder syntax** (`- 15m 65-75% Pace`, `5x`, etc.) so `intervals.icu` automatically syncs structured intervals to your **Suunto** watch.
-- **Strength Workouts (`WeightTraining`):** Uploaded as readable **calendar notes** in `intervals.icu` (exercises, sets, reps, rest). Because they are notes rather than Suunto guide workouts, `intervals.icu` never attempts a watch push for them — this avoids the `Suunto upload failed` flag that a step-less strength "workout" triggers.
+- **Strength Workouts (`WeightTraining`):** Uploaded as **structured workouts** in `intervals.icu` (readable exercise text for exercises, sets, reps, rest). Because `intervals.icu` only builds a SuuntoPlus Guide for `WORKOUT` events and Suunto rejects a guide with zero steps, a single duration-only **summary step** covering the session (e.g. `- 55m`) is appended automatically. The session therefore syncs to Suunto as a valid guide and never triggers the `Suunto upload failed` flag, while the planner's `estimated_load` is preserved.
 
 ### Confirmation Gate (writes & deletes)
 Every mutating tool defaults to `confirm=false` and returns a `confirmation_required` preview instead of acting:

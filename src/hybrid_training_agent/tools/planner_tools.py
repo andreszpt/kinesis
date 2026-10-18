@@ -8,13 +8,15 @@ from langchain_core.tools import tool
 from hybrid_training_agent.clients.intervals_client import (
     IntervalsIcuClient,
     IntervalsIcuError,
+    ensure_strength_summary_step,
+    has_valid_step_line,
     validate_intervals_run_syntax,
 )
 from hybrid_training_agent.models import PlannedWorkoutInput
 
 
 def audit_planned_workouts(workouts: list[PlannedWorkoutInput]) -> dict[str, Any]:
-    """Validate intervals.icu workout syntax for Suunto running sync and audit concurrent interference spacing."""
+    """Validate intervals.icu workout syntax for Suunto sync and audit concurrent interference spacing."""
     syntax_checks: list[dict[str, Any]] = []
     interference_warnings: list[str] = []
     total_run_minutes = 0
@@ -45,13 +47,22 @@ def audit_planned_workouts(workouts: list[PlannedWorkoutInput]) -> dict[str, Any
                 }
             )
         elif w.sport_type == "WeightTraining":
+            # Strength sessions are uploaded as Suunto-synced WORKOUT events, so they always need
+            # at least one step. The payload builder appends a summary step when none is present.
+            effective_description = ensure_strength_summary_step(
+                w.description, w.moving_time_minutes
+            )
+            has_steps = has_valid_step_line(effective_description)
             syntax_checks.append(
                 {
                     "date": day_str,
                     "name": w.name,
                     "sport_type": w.sport_type,
-                    "is_valid_structured_workout": bool(w.description.strip()),
-                    "issues": [] if w.description.strip() else ["WeightTraining description is empty."],
+                    "is_valid_structured_workout": has_steps,
+                    "summary_step_added": effective_description != w.description,
+                    "issues": []
+                    if has_steps
+                    else ["WeightTraining description produced no Suunto step."],
                 }
             )
 
@@ -170,7 +181,7 @@ def validate_and_preview_training_plan(
 
     Checks:
     1. Every 'Run' workout uses valid intervals.icu step syntax (e.g. `- 10m 65-75% Pace`) so it syncs as a structured workout to Suunto.
-    2. Every 'WeightTraining' workout is formatted as a readable text workout and uploaded as an intervals.icu calendar note (no Suunto step syntax, no watch guide push).
+    2. Every 'WeightTraining' workout is uploaded as a Suunto-synced structured workout; if the readable description has no step line, a single summary step is added automatically so Suunto accepts the guide.
     3. Audits concurrent training spacing (6-24h rule between heavy lower-body lifting and quality/long runs).
 
     Each item in `workouts` must have:
@@ -199,9 +210,10 @@ def upload_training_plan_to_intervals(
     """Upload a list of planned Running and Strength workouts (or Notes) to intervals.icu calendar.
 
     Uses `POST /api/v1/athlete/{id}/events/bulk` with `upsert=true` so re-uploading updates existing events cleanly.
-    Running workouts formatted with intervals.icu step syntax (`- 10m 70-78% Pace`) will automatically sync to Suunto,
-    while WeightTraining workouts are uploaded as readable calendar notes so intervals.icu never attempts a Suunto
-    guide push for them (which would fail for a step-less strength workout).
+    Running workouts use intervals.icu step syntax (`- 10m 70-78% Pace`) and sync to Suunto, and WeightTraining
+    workouts are uploaded as Suunto-synced structured workouts too: if the readable strength description contains
+    no step line, a single summary step is appended so intervals.icu always builds a valid (>= 1 step) SuuntoPlus
+    Guide and the upload never fails.
 
     SAFETY: call first with `confirm=false` (default) to get a preview. You MUST show that preview to the user and
     ask for explicit confirmation. Only call again with `confirm=true` after the user clearly agrees.
@@ -294,6 +306,20 @@ def update_calendar_event(
     except IntervalsIcuError as exc:
         return {"status": "failed", "event_id": event_id, "error": str(exc)}
 
+    # Keep Suunto uploads valid: a WeightTraining WORKOUT must carry at least one step, so ensure
+    # one is present on the resulting description before previewing/applying the change.
+    effective_type = updates.get("type", current.get("type"))
+    effective_category = updates.get("category", current.get("category"))
+    if effective_category == "WORKOUT" and effective_type == "WeightTraining":
+        moving_time = updates.get("moving_time", current.get("moving_time"))
+        effective_description = updates.get("description", current.get("description") or "")
+        ensured_description = ensure_strength_summary_step(
+            effective_description,
+            int(moving_time / 60) if moving_time else None,
+        )
+        if ensured_description != effective_description:
+            updates = {**updates, "description": ensured_description}
+
     if not confirm:
         changes = {
             key: {"from": current.get(key), "to": value}
@@ -378,15 +404,24 @@ def save_workouts_to_library(
     for workout in workouts:
         sport = str(workout.get("sport_type") or workout.get("type") or "Run")
         target_folder = workout.get("folder_id", folder_id)
+        moving_time_minutes = workout.get("moving_time_minutes")
+        description = workout.get("description") or ""
+        if sport == "WeightTraining":
+            # Library workouts are pushed to Suunto when applied to the calendar, so they need a
+            # valid step too.
+            description = ensure_strength_summary_step(
+                description,
+                int(float(moving_time_minutes)) if moving_time_minutes is not None else None,
+            )
         payload: dict[str, Any] = {
             "name": workout.get("name") or "Untitled workout",
             "type": sport,
-            "description": workout.get("description") or "",
+            "description": description,
         }
         if target_folder is not None:
             payload["folder_id"] = int(target_folder)
-        if workout.get("moving_time_minutes") is not None:
-            payload["moving_time"] = int(float(workout["moving_time_minutes"]) * 60)
+        if moving_time_minutes is not None:
+            payload["moving_time"] = int(float(moving_time_minutes) * 60)
         if workout.get("estimated_load") is not None:
             payload["icu_training_load"] = int(workout["estimated_load"])
         if workout.get("day") is not None:

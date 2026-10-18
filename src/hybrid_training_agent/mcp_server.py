@@ -87,7 +87,7 @@ def mcp_get_upcoming_intervals_calendar(days_ahead: int = 14) -> dict[str, Any]:
 def mcp_validate_and_preview_training_plan(
     workouts: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Validate intervals.icu workout syntax for Suunto running sync and audit concurrent interference spacing."""
+    """Validate intervals.icu workout syntax for Suunto sync and audit concurrent interference spacing."""
     return validate_and_preview_training_plan.invoke({"workouts": workouts})
 
 
@@ -189,6 +189,9 @@ def mcp_upload_training_plan_to_intervals(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Upload planned Running and Strength workouts to intervals.icu calendar.
+
+    Strength workouts are uploaded as Suunto-synced structured workouts with an automatic
+    summary step, so the guide is always valid.
 
     Call with confirm=false first to get a preview; only pass confirm=true after the user agrees.
     """

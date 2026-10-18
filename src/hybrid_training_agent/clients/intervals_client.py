@@ -34,6 +34,42 @@ _TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# intervals.icu builds a SuuntoPlus Guide for every WORKOUT event and Suunto rejects a guide with
+# zero steps ("Invalid 'guide.steps': collection has less items than the allowed minimum (1)").
+# Strength sessions are plain readable text with no natural step lines, so a single duration-only
+# summary step is appended to guarantee a valid guide. It carries no intensity target on purpose:
+# intervals.icu would otherwise recompute the load from HR and discard the planner's estimate.
+STRENGTH_SUMMARY_DEFAULT_MINUTES = 45
+
+
+def has_valid_step_line(description: str) -> bool:
+    """True if the description contains at least one parseable intervals.icu step line."""
+    return any(
+        _STEP_LINE_RE.match(line)
+        for line in (raw.strip() for raw in description.splitlines())
+        if line.startswith("-")
+    )
+
+
+def ensure_strength_summary_step(
+    description: str, moving_time_minutes: int | None = None
+) -> str:
+    """Guarantee a WeightTraining description parses to at least one intervals.icu/Suunto step.
+
+    The step spans the session so the readable exercise text is preserved; it is only appended
+    when the description has no valid step line of its own.
+    """
+    if has_valid_step_line(description):
+        return description
+    minutes = (
+        int(moving_time_minutes)
+        if moving_time_minutes and moving_time_minutes > 0
+        else STRENGTH_SUMMARY_DEFAULT_MINUTES
+    )
+    step = f"- {minutes}m"
+    body = description.strip()
+    return f"{body}\n\n{step}" if body else step
+
 
 def validate_intervals_run_syntax(description: str) -> dict[str, Any]:
     """Validate that a Run workout description uses intervals.icu step syntax for Suunto sync.
@@ -236,11 +272,11 @@ class IntervalsIcuClient:
             # Validate ISO format
             datetime.fromisoformat(dt_str)
 
-        # 'Note' events are calendar notes. Strength sessions are uploaded as notes too:
-        # intervals.icu only builds SuuntoPlus Guides for WORKOUT events, and Suunto rejects
-        # a guide with no steps. Strength sessions are plain readable text (no step lines),
-        # so pushing them as workouts fails with "Suunto upload failed" every time.
-        if workout.sport_type in ("Note", "WeightTraining"):
+        # Calendar notes stay plain notes. Running and strength sessions are uploaded as
+        # WORKOUT events. intervals.icu only builds a SuuntoPlus Guide for WORKOUT events and
+        # Suunto rejects a guide with zero steps, so strength sessions (plain readable text with
+        # no step lines) get a single summary step to guarantee a valid Suunto upload.
+        if workout.sport_type == "Note":
             payload: dict[str, Any] = {
                 "category": "NOTE",
                 "start_date_local": dt_str,
@@ -248,12 +284,17 @@ class IntervalsIcuClient:
                 "description": workout.description,
             }
         else:
+            description = workout.description
+            if workout.sport_type == "WeightTraining":
+                description = ensure_strength_summary_step(
+                    description, workout.moving_time_minutes
+                )
             payload = {
                 "category": "WORKOUT",
                 "type": workout.sport_type,
                 "start_date_local": dt_str,
                 "name": workout.name,
-                "description": workout.description,
+                "description": description,
             }
             if workout.moving_time_minutes is not None:
                 payload["moving_time"] = int(workout.moving_time_minutes * 60)
