@@ -84,15 +84,19 @@ Copy-Item .env.example .env
 - **LLM API Key**: Set `OPENCODE_GO_API_KEY` (or `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
 - **Intervals.icu API Key**: Set `INTERVALS_ICU_API_KEY` (found in `intervals.icu` → *Settings* → *Developer Settings* → *API Key*). Leave `INTERVALS_ICU_ATHLETE_ID=0` (which automatically resolves your authenticated athlete profile).
 
-### 2. CLI Commands
+### 2. TUI & CLI Commands
 
 Run from the project root:
 
 ```powershell
-# 1. Check configuration and test live intervals.icu connection
+# 1. Launch the full-screen interactive Textual TUI (Chat + Readiness Sidebar + Analytics/Calendar/Evidence Tabs)
+uv run kinesis
+# (or explicitly: uv run kinesis tui)
+
+# 2. Check configuration and test live intervals.icu connection
 uv run kinesis status
 
-# 2. Launch interactive multi-turn coaching chat
+# 3. Launch classic inline multi-turn coaching chat
 uv run kinesis chat
 # In-chat quick commands: /plan [request] (plan one or more workouts), /analyze, /evidence,
 # /status, /clear, /quit. Example: /plan 45m easy run tomorrow + 60m full body strength Friday

@@ -505,6 +505,14 @@ def chat_cmd() -> None:
         )
 
 
+@app.command("tui")
+def tui_cmd() -> None:
+    """Launch the full-screen interactive Textual TUI (Chat + Sidebar + Tabs)."""
+    from hybrid_training_agent.tui import run_tui
+
+    run_tui()
+
+
 @app.command("mcp")
 def mcp_cmd() -> None:
     """Run the Kinesis MCP Server over stdio (for OpenCode / Claude Desktop)."""
@@ -516,7 +524,7 @@ def mcp_cmd() -> None:
 @app.callback(invoke_without_command=True)
 def main_callback(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
-        chat_cmd()
+        tui_cmd()
 
 
 def main() -> None:
