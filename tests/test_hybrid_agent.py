@@ -191,6 +191,33 @@ def test_compute_hybrid_analytics_and_interference() -> None:
     ]
 
 
+def test_analytics_fetches_wellness_and_activities_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from hybrid_training_agent.tools import analytics_tools as analytics_module
+
+    # Both reads must reach the barrier before either can finish. A sequential
+    # implementation times out instead of completing the report.
+    both_started = threading.Barrier(2)
+
+    class ConcurrentClient:
+        def get_wellness(self, **kwargs: Any) -> list[dict[str, Any]]:
+            both_started.wait(timeout=2)
+            return []
+
+        def get_activities(self, **kwargs: Any) -> list[dict[str, Any]]:
+            both_started.wait(timeout=2)
+            return []
+
+    monkeypatch.setattr(analytics_module, "IntervalsIcuClient", ConcurrentClient)
+    report = analytics_module.analyze_training_and_wellness.invoke({"days_back": 28})
+
+    assert report["analysis_window_days"] == 28
+    assert report["activity_log"] == []
+
+
 def test_audit_planned_workouts_and_bulk_upload() -> None:
     workouts = [
         PlannedWorkoutInput(
@@ -397,6 +424,45 @@ def test_default_plan_skips_researcher_subagent() -> None:
         "Hybrid_Coach_Planner",
     ]
     assert isinstance(state_out["messages"][-1].content, str)
+
+
+def test_graph_reuses_one_default_model_across_agents_and_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = _RecordingFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="Analyst: ready."),
+                AIMessage(content="Planner: session."),
+                AIMessage(content="Analyst: 20 km."),
+            ]
+        )
+    )
+    model_creations = 0
+
+    def create_model(*args: Any, **kwargs: Any) -> Any:
+        nonlocal model_creations
+        model_creations += 1
+        return fake_llm
+
+    monkeypatch.setattr(graph_module, "get_chat_model", create_model)
+    graph = build_hybrid_training_graph()
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="Create a 60m strength session")],
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="How many km did I run this week?")],
+            "visited_agents": [],
+            "mode": "auto",
+        }
+    )
+
+    assert model_creations == 1
 
 
 def test_subagent_requests_never_replay_foreign_thinking_blocks() -> None:
@@ -1004,8 +1070,8 @@ def test_llm_router_handles_ambiguous_follow_up() -> None:
     )
     assert state["router"] == "llm"
     assert state["visited_agents"] == ["planner"]
-    # Decided once, then asked again after the hop (and stopped since planner was already run).
-    assert router.calls == 2
+    # The planner is terminal, so no second router call is needed after its answer.
+    assert router.calls == 1
 
 
 def test_supervisor_falls_back_to_heuristic_when_router_fails() -> None:

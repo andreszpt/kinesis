@@ -33,7 +33,7 @@
 The supervisor decides who runs, in three tiers:
 1. **Tier 1 — deterministic heuristic** (`classify_intent`, zero latency). Used when intent is explicit: a plan keyword (*plan, schedule, program, mesocycle, periodize, prescribe, upload*) or an action verb (*create, move, save, delete, apply, …*) aimed at a workout/training noun; a data/quantity question (*how many, what's my, when did I, km, weekly, summary*); or an evidence request (*pubmed, citations, science, why*). This keeps the common cases instant and testable.
 2. **Tier 2 — structured-output LLM supervisor**. Consulted **only** when Tier 1 finds no signal (e.g. short follow-ups like "sounds good, go ahead"). It returns one decision (`analyst` / `researcher` / `planner` / `FINISH`) via `with_structured_output(RouteDecision)`. Set `KINESIS_ROUTER_MODEL` to route with a cheaper model; if the call fails, the heuristic plan is used as a fallback.
-3. **Tier 3 — per-step `Command` loop**. The supervisor is a real loop: it returns a LangGraph `Command(goto=…)` for **one hop at a time** (rather than a fixed analyst→researcher→planner list), re-deciding after every sub-agent, so it can stop early, skip an agent, or follow up before finishing.
+3. **Tier 3 — per-step `Command` loop**. The supervisor is a real loop: it returns a LangGraph `Command(goto=…)` for **one hop at a time** (rather than a fixed analyst→researcher→planner list), re-deciding after each non-terminal sub-agent, so it can stop early, skip an agent, or follow up before finishing. The planner is terminal, so its final answer ends the turn without another router call.
 
 Routing regressions are guarded by a labelled eval set (`tests/routing_eval_cases.json`) asserting the Tier-1 heuristic, plus unit tests for the Tier-2 router and its fallback.
 
@@ -66,8 +66,8 @@ The planner must show that preview to you and ask for explicit confirmation, the
 ### Latency Optimizations
 `ask` and `chat` are tuned to minimize network trips and model round trips:
 - **Deterministic pre-fetch:** the analyst's profile + training/wellness analysis, the researcher's curated evidence, and the planner's upcoming calendar are fetched up front and injected into the sub-agent context, so an agent answers in one model call instead of spending a turn choosing tools. The analyst honors the period the request refers to (`last 60 days`, `since 2025`, `this year`) and includes a per-activity `activity_log` for on-the-fly grouping.
-- **Concurrent I/O:** independent tool calls (and pre-fetches) run in a thread pool instead of sequentially.
-- **Connection reuse + read cache:** one pooled `httpx` client serves both intervals.icu and PubMed, and read responses are cached in-process for `KINESIS_CACHE_TTL_SECONDS` (default `60`, `0` disables). Any write (upload/delete) invalidates cached reads.
+- **Concurrent I/O:** independent tool calls and pre-fetches (including wellness + activity reads) run in a thread pool instead of sequentially.
+- **Connection reuse + read cache:** the main LLM client is reused across agents and chat turns, one pooled `httpx` client serves both intervals.icu and PubMed, and read responses are cached in-process for `KINESIS_CACHE_TTL_SECONDS` (default `60`, `0` disables). Any write (upload/delete) invalidates cached reads.
 - **Lean tool payloads:** the planner normally binds only `validate_and_preview_training_plan` + `upload_training_plan_to_intervals`, adding delete/update/library tools solely when the request mentions them; the analyst's benchmarking tools are bound only for analysis-style requests; the literature sub-agent runs only when evidence is requested.
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from statistics import mean, stdev
 from typing import Any
@@ -368,8 +369,17 @@ def analyze_training_and_wellness(days_back: int = 28) -> dict[str, Any]:
     newest = today.isoformat()
 
     try:
-        wellness = client.get_wellness(oldest=oldest, newest=newest)
-        activities = client.get_activities(oldest=oldest, newest=newest)
+        # These are independent, slow API reads. Fetch them together so the analysis
+        # waits for the slower response rather than the sum of both response times.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            wellness_future = pool.submit(
+                client.get_wellness, oldest=oldest, newest=newest
+            )
+            activities_future = pool.submit(
+                client.get_activities, oldest=oldest, newest=newest
+            )
+            wellness = wellness_future.result()
+            activities = activities_future.result()
     except IntervalsIcuError as exc:
         return {"error": str(exc)}
 

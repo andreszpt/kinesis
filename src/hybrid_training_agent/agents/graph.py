@@ -619,20 +619,29 @@ def build_hybrid_training_graph(
          only when Tier 1 is not confident (e.g. short follow-ups like "sounds good, go ahead").
       3. Tier 3 - the supervisor is a real per-step loop: it returns a `Command` for the next hop
          (one sub-agent at a time) instead of a fixed pipeline, so it can adapt mid-run.
+         The terminal planner answer ends the turn without a redundant router call.
     """
-    def _get_llm() -> BaseChatModel:
-        return llm if llm is not None else get_chat_model()
+    # A chat model owns its provider HTTP connection pool. Keep one instance for the
+    # compiled graph so all agents and chat turns reuse it instead of reconnecting.
+    cached_llm = llm
+    cached_router_llm = router_llm
 
-    def _get_router_llm() -> BaseChatModel | None:
+    def _get_llm() -> BaseChatModel:
+        nonlocal cached_llm
+        if cached_llm is None:
+            cached_llm = get_chat_model()
+        return cached_llm
+
+    def _get_router_llm() -> BaseChatModel:
         """Tier-2/3 router model: explicit override, KINESIS_ROUTER_MODEL, else the main model."""
-        if router_llm is not None:
-            return router_llm
+        nonlocal cached_router_llm
+        if cached_router_llm is not None:
+            return cached_router_llm
         model_name = os.getenv("KINESIS_ROUTER_MODEL", "").strip()
-        if model_name:
-            return get_chat_model(model=model_name)
-        if llm is not None:
-            return llm
-        return get_chat_model()
+        cached_router_llm = (
+            get_chat_model(model=model_name) if model_name else _get_llm()
+        )
+        return cached_router_llm
 
     def _next_hop(pipeline: list[str], visited: list[str]) -> str:
         for candidate in pipeline:
@@ -646,8 +655,6 @@ def build_hybrid_training_graph(
     def _llm_route(state: HybridAgentState, visited: list[str]) -> str | None:
         """Tier-2/Tier-3 LLM routing. Returns the next agent, or None on failure."""
         model = _get_router_llm()
-        if model is None:
-            return None
         try:
             structured = model.with_structured_output(RouteDecision)
             visited_hint = ", ".join(visited) if visited else "none"
@@ -694,8 +701,12 @@ def build_hybrid_training_graph(
                 update={"pipeline": plan.pipeline, "router": "heuristic-fallback"},
             )
 
-        # Tier-3 loop: an LLM-supervised turn re-decides after every hop.
+        # Tier-3 loop: an LLM-supervised turn re-decides after non-terminal hops. The
+        # planner is always the terminal specialist, so do not spend another model
+        # call asking the router to confirm that its final answer ends the turn.
         if router == "llm":
+            if "planner" in visited:
+                return Command(goto=END)
             decision = _llm_route(state, visited)
             if decision and decision not in visited:
                 return Command(goto=_target(decision))

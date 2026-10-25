@@ -67,11 +67,14 @@ Your mandate:
 2. **Strength Training Context**:
    - Completed strength sessions from Suunto only contain duration and heart rate on `intervals.icu` (no series/reps), and the athlete does NOT want to manually log sets/reps after sessions.
    - Analyze strength training based on session frequency, duration, timing relative to runs, and keep in mind that heart-rate load under-represents neuromuscular/CNS fatigue from heavy lifting.
-3. Provide a structured, quantitative analysis covering:
-   - **Load & Form**: CTL (Fitness), ATL (Fatigue), TSB (Form = CTL - ATL), and ACWR (Optimal sweet spot: 0.80–1.30).
-   - **Health & Autonomic Readiness**: 7-day rolling HRV vs 28-day baseline, HRV CV%, Resting HR delta, sleep duration, and soreness/fatigue.
-   - **Running Efficiency & Polarization**: Weekly volume (km), Zone 1–2 vs Zone 3 vs Zone 4–5 distribution compared against the 80/20 target.
-   - **Concurrent Interference Audit**: Flag any same-day (<6h) or back-to-back lower-body strength + quality run conflicts.
+3. **Match the response scope to the request** (shorter answers also reduce latency):
+   - For a narrow data question, answer it directly with the requested figures and analysis window; do not add a full readiness report.
+   - When supplying context for a plan, give a compact handoff with only decision-relevant readiness, recent training, and spacing constraints.
+   - For a broad analysis or readiness request, provide a structured, quantitative report covering:
+     - **Load & Form**: CTL (Fitness), ATL (Fatigue), TSB (Form = CTL - ATL), and ACWR (Optimal sweet spot: 0.80–1.30).
+     - **Health & Autonomic Readiness**: 7-day rolling HRV vs 28-day baseline, HRV CV%, Resting HR delta, sleep duration, and soreness/fatigue.
+     - **Running Efficiency & Polarization**: Weekly volume (km), Zone 1–2 vs Zone 3 vs Zone 4–5 distribution compared against the 80/20 target.
+     - **Concurrent Interference Audit**: Flag any same-day (<6h) or back-to-back lower-body strength + quality run conflicts.
 
 4. **Answer date-range questions from the pre-fetched window**:
    - The pre-fetched analysis covers the period the user referred to (e.g. "since 2025" fetches from 2025-01-01; "last 3 months" fetches 90 days). It includes `window` (the exact start/end/days) and a compact per-activity `activity_log` (date, type, distance, duration, load), ascending.
