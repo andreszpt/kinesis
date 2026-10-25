@@ -10,11 +10,12 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
+from textual.message import Message
 from textual.theme import Theme
 from textual.widgets import (
     Button,
@@ -26,6 +27,7 @@ from textual.widgets import (
     Static,
     TabbedContent,
     TabPane,
+    TextArea,
 )
 
 from hybrid_training_agent.agents.graph import build_hybrid_training_graph
@@ -58,7 +60,8 @@ MUTATING_TOOL_MAP = {
 
 WELCOME_MARKDOWN = (
     "**Kinesis** — Hybrid Running & Strength Coach\n\n"
-    "Ask anything, or use `/plan <workout>`, `/analyze [days]`, `/evidence [query]`, `/status`, `/clear`."
+    "Ask anything, or use `/plan <workout>`, `/analyze [days]`, `/evidence [query]`, `/status`, `/clear`.\n\n"
+    "*Enter sends · Shift+Enter (or Ctrl+J) adds a line.*"
 )
 
 CURATED_CATEGORY_LABELS = {
@@ -612,6 +615,40 @@ class StatusOverlay(Static):
     can_focus = True
 
 
+class ChatTextArea(TextArea):
+    """Multiline chat composer: Enter sends, Shift+Enter inserts a newline."""
+
+    class Submitted(Message):
+        """Posted when the user presses Enter to send the composer contents."""
+
+        def __init__(self, input: ChatTextArea, text: str) -> None:
+            super().__init__()
+            self.input = input
+            self.text = text
+
+        @property
+        def control(self) -> ChatTextArea:
+            """The composer that posted this message."""
+            return self.input
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
+            return
+        if event.key in ("shift+enter", "ctrl+j", "alt+enter"):
+            event.stop()
+            event.prevent_default()
+            result = self.replace(
+                "\n", *self.selection, maintain_selection_offset=False
+            )
+            if result is not None:
+                self.move_cursor(result.end_location)
+            return
+        await super()._on_key(event)
+
+
 class ConfirmationBanner(Container):
     """Inline confirmation bar shown when a mutating tool needs approval."""
 
@@ -894,7 +931,8 @@ class KinesisTUI(App[None]):
     }
 
     #chat-input-bar {
-        height: 3;
+        height: auto;
+        min-height: 3;
         padding: 0;
         align: left middle;
     }
@@ -914,7 +952,22 @@ class KinesisTUI(App[None]):
         text-style: bold;
     }
 
-    #chat-input, #evidence-query-input {
+    #chat-input {
+        width: 1fr;
+        height: auto;
+        min-height: 3;
+        max-height: 7;
+        padding: 0 2;
+        border: round $k-line;
+        background: $k-surface;
+        color: $k-text;
+    }
+
+    #chat-input .text-area--placeholder {
+        color: $k-muted;
+    }
+
+    #evidence-query-input {
         width: 1fr;
         height: 3;
         padding: 0 2;
@@ -1231,9 +1284,12 @@ class KinesisTUI(App[None]):
                         yield ConfirmationBanner(id="confirmation-bar")
                         with Horizontal(id="chat-input-bar"):
                             yield Static("auto", id="mode-chip")
-                            yield Input(
+                            yield ChatTextArea(
                                 placeholder="Ask anything",
                                 id="chat-input",
+                                show_line_numbers=False,
+                                highlight_cursor_line=False,
+                                soft_wrap=True,
                             )
                     with VerticalScroll(id="sidebar"):
                         yield Static(
@@ -1369,7 +1425,7 @@ class KinesisTUI(App[None]):
             if label == "Name":
                 self._calendar_name_key = key
 
-        self.query_one("#chat-input", Input).focus()
+        self.query_one("#chat-input", ChatTextArea).focus()
         self._apply_layout()
 
         if self._auto_refresh_on_mount:
@@ -1400,7 +1456,7 @@ class KinesisTUI(App[None]):
                 pass
         elif was_too_small and not self._is_too_small:
             try:
-                self.query_one("#chat-input", Input).focus()
+                self.query_one("#chat-input", ChatTextArea).focus()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1524,10 +1580,10 @@ class KinesisTUI(App[None]):
     def action_quick_plan(self) -> None:
         self.query_one("#main-tabs", TabbedContent).active = "tab-chat"
         self._set_mode("plan")
-        chat_input = self.query_one("#chat-input", Input)
-        if not chat_input.value.startswith("/plan"):
-            chat_input.value = "/plan "
-            chat_input.cursor_position = len(chat_input.value)
+        chat_input = self.query_one("#chat-input", ChatTextArea)
+        if not chat_input.text.startswith("/plan"):
+            chat_input.load_text("/plan ")
+            chat_input.move_cursor(chat_input.document.end)
         chat_input.focus()
 
     def action_stop_turn(self) -> None:
@@ -1544,7 +1600,7 @@ class KinesisTUI(App[None]):
 
     def action_tab_chat(self) -> None:
         self.query_one("#main-tabs", TabbedContent).active = "tab-chat"
-        self.query_one("#chat-input", Input).focus()
+        self.query_one("#chat-input", ChatTextArea).focus()
 
     def action_tab_analytics(self) -> None:
         self.query_one("#main-tabs", TabbedContent).active = "tab-analytics"
@@ -1850,7 +1906,7 @@ class KinesisTUI(App[None]):
             banner.remove_class("visible")
             if not self._is_too_small:
                 try:
-                    self.query_one("#chat-input", Input).focus()
+                    self.query_one("#chat-input", ChatTextArea).focus()
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -2050,7 +2106,7 @@ class KinesisTUI(App[None]):
                     pass
             elif not self._is_too_small:
                 try:
-                    self.query_one("#chat-input", Input).focus()
+                    self.query_one("#chat-input", ChatTextArea).focus()
                 except Exception:  # noqa: BLE001
                     pass
             if self._queued_messages:
@@ -2098,7 +2154,7 @@ class KinesisTUI(App[None]):
             self._busy_task = None
             self._stop_thinking()
             try:
-                self.query_one("#chat-input", Input).focus()
+                self.query_one("#chat-input", ChatTextArea).focus()
             except Exception:  # noqa: BLE001
                 pass
             if self._queued_messages:
@@ -2144,17 +2200,16 @@ class KinesisTUI(App[None]):
     # ------------------------------------------------------------------
     # UI Event Handlers
     # ------------------------------------------------------------------
-    @on(Input.Submitted, "#chat-input")
-    async def _on_chat_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
+    @on(ChatTextArea.Submitted, "#chat-input")
+    async def _on_chat_input_submitted(self, event: ChatTextArea.Submitted) -> None:
+        text = event.text.strip()
+        event.input.clear()
         if not text:
             return
         if self._is_busy:
             self._queued_messages.append(text)
-            event.input.value = ""
             self._set_activity_status(self._thinking_status_text())
             return
-        event.input.value = ""
         await self.submit_user_input(text)
 
     @on(Button.Pressed, "#btn-approve-confirm")

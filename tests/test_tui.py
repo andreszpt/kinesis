@@ -13,6 +13,7 @@ import pytest
 import respx
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from rich.console import Console
+from textual import events
 from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Input, TabbedContent
 
@@ -22,6 +23,7 @@ from hybrid_training_agent.clients.intervals_client import _intervals_cache
 from hybrid_training_agent.clients.science_client import _science_cache
 from hybrid_training_agent.tui import (
     ChatMessageCard,
+    ChatTextArea,
     ConfirmationBanner,
     KinesisTUI,
     PendingConfirmation,
@@ -352,7 +354,7 @@ async def test_tui_analytics_day_selector_and_ai_commentary() -> None:
         assert not app.query_one("#btn-ai-analytics").disabled
 
 def _freeze_cursor(app: KinesisTUI) -> None:
-    for input_widget in app.query(Input):
+    for input_widget in [*app.query(Input), *app.query(ChatTextArea)]:
         input_widget.cursor_blink = False
 
 
@@ -608,7 +610,7 @@ async def test_tui_layout_breakpoints() -> None:
         assert sidebar.has_class("hidden")
         assert app.query_one("#analytics-activities-pane").has_class("pane-hidden")
         assert app.query_one("#library-pane").has_class("pane-hidden")
-        chat_input = app.query_one("#chat-input", Input)
+        chat_input = app.query_one("#chat-input", ChatTextArea)
         assert chat_input.display
         assert chat_input.region.bottom <= 24
         assert app.query_one("#chat-main").region.width == 80
@@ -622,7 +624,7 @@ async def test_tui_layout_breakpoints() -> None:
         await pilot.pause(0.2)
         assert app.query_one("#sidebar", VerticalScroll).has_class("hidden")
         assert app.query_one("#chat-main").region.width == 60
-        assert app.query_one("#chat-input", Input).region.bottom <= 24
+        assert app.query_one("#chat-input", ChatTextArea).region.bottom <= 24
 
     app = KinesisTUI(auto_refresh_on_mount=False)
     async with app.run_test(size=(60, 18)) as pilot:
@@ -650,7 +652,7 @@ async def test_confirmation_banner_layout_and_keys() -> None:
         banner = app.query_one("#confirmation-bar", ConfirmationBanner)
         summary = app.query_one("#confirmation-summary")
         actions = app.query_one("#confirmation-actions")
-        chat_input = app.query_one("#chat-input", Input)
+        chat_input = app.query_one("#chat-input", ChatTextArea)
 
         assert banner.display and banner.has_class("visible")
         assert isinstance(app.focused, ConfirmationBanner)
@@ -666,7 +668,7 @@ async def test_confirmation_banner_layout_and_keys() -> None:
         await pilot.pause(0.3)
         assert app.pending_confirmations == []
         assert not banner.has_class("visible")
-        assert isinstance(app.focused, Input)
+        assert isinstance(app.focused, ChatTextArea)
 
 
 @pytest.mark.asyncio
@@ -687,12 +689,12 @@ async def test_busy_input_queues_and_escape_stops() -> None:
         await pilot.pause(0.2)
         assert app._is_busy
 
-        chat_input = app.query_one("#chat-input", Input)
-        chat_input.value = "second"
+        chat_input = app.query_one("#chat-input", ChatTextArea)
+        chat_input.text = "second"
         await pilot.press("enter")
         await pilot.pause(0.1)
         assert app._queued_messages == ["second"]
-        assert chat_input.value == ""
+        assert chat_input.text == ""
         status = str(app.query_one("#agent-activity-bar").content)
         assert "Thinking" in status and "esc stop" in status
 
@@ -835,7 +837,7 @@ async def test_chrome_has_one_row_top_tabs_footer_and_no_duplicate_slash_hints()
         tabs = app.query_one("#main-tabs", TabbedContent).query_one("Tabs")
         assert tabs.region.height == 2
         assert "/plan" not in str(app.query_one("#top-telemetry").content)
-        assert "/plan" not in app.query_one("#chat-input", Input).placeholder
+        assert "/plan" not in app.query_one("#chat-input", ChatTextArea).placeholder
         assert "/plan" not in str(app.query_one("#bottom-hints").content)
         assert "/plan" not in str(app.query_one("#bottom-keys").content)
 
@@ -877,5 +879,50 @@ async def test_confirmation_summary_ellipsizes_at_narrow_width() -> None:
         assert summary.region.height == 2
         assert len(text.splitlines()) <= 2
         assert text.rstrip().endswith("…")
-        assert app.query_one("#chat-input", Input).display
-        assert app.query_one("#chat-input", Input).region.bottom <= 24
+        assert app.query_one("#chat-input", ChatTextArea).display
+        assert app.query_one("#chat-input", ChatTextArea).region.bottom <= 24
+
+@pytest.mark.asyncio
+async def test_chat_composer_supports_multiline_shift_enter_and_paste() -> None:
+    class _EchoGraph:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def invoke(self, state: dict[str, Any]) -> dict[str, Any]:
+            self.texts.append(state["messages"][-1].content)
+            msgs = list(state["messages"]) + [
+                AIMessage(content="Echo received.", name="Hybrid_Coach_Planner")
+            ]
+            return {
+                "messages": msgs,
+                "visited_agents": ["planner"],
+                "pipeline": ["planner"],
+                "router": "heuristic",
+            }
+
+    graph = _EchoGraph()
+    app = KinesisTUI(graph=graph, auto_refresh_on_mount=False)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.2)
+        chat_input = app.query_one("#chat-input", ChatTextArea)
+        chat_input.focus()
+
+        await pilot.press("h", "i")
+        await pilot.press("shift+enter")
+        await pilot.press("t", "h", "e", "r", "e")
+        assert chat_input.text == "hi\nthere"
+
+        app.post_message(events.Paste("alpha\nbeta"))
+        await pilot.pause(0.15)
+        assert chat_input.text == "hi\ntherealpha\nbeta"
+
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        assert graph.texts == ["hi\ntherealpha\nbeta"]
+        assert chat_input.text == ""
+
+        # The composer grows with its content but never exceeds the cap.
+        chat_input.text = "\n".join(f"line {i}" for i in range(12))
+        await pilot.pause(0.2)
+        assert chat_input.region.height == 7
+        assert chat_input.region.bottom <= 24
