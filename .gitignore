@@ -22,3 +22,16 @@ env/
 # Local data & logs
 data/
 *.log
+
+# Local agent/skill tooling
+.agents/
+skills-lock.json
+
+# TUI review captures, scratch design frames, and local review scripts
+tui-review/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

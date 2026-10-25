@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import textwrap
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.events import Resize
 from textual.theme import Theme
 from textual.widgets import (
     Button,
     DataTable,
-    Footer,
     Input,
     Label,
     Markdown,
@@ -56,6 +60,116 @@ WELCOME_MARKDOWN = (
     "**Kinesis** — Hybrid Running & Strength Coach\n\n"
     "Ask anything, or use `/plan <workout>`, `/analyze [days]`, `/evidence [query]`, `/status`, `/clear`."
 )
+
+CURATED_CATEGORY_LABELS = {
+    "concurrent_interference": "Concurrent Training Interference",
+    "running_economy_and_strength": "Running Economy & Strength",
+    "intensity_distribution_and_polarization": "Intensity Distribution & Polarization",
+    "hrv_and_load_monitoring": "HRV & Load Monitoring",
+}
+
+_PALETTE = {
+    "base": "#1e1e2e",
+    "panel": "#181825",
+    "surface": "#313244",
+    "raised": "#45475a",
+    "text": "#cdd6f4",
+    "muted": "#a6adc8",
+    "line": "#7f849c",
+    "focus": "#b4befe",
+    "accent": "#89b4fa",
+    "status": "#a6e3a1",
+    "warn": "#f9e2af",
+    "danger": "#f38ba8",
+}
+
+
+def _fmt(value: Any, suffix: str = "", empty: str = "—") -> str:
+    """Render a value without ever leaking ``None`` into the UI."""
+    if value is None or value == "":
+        return empty
+    return f"{value}{suffix}"
+
+
+def _whole(value: Any, empty: str = "—") -> str:
+    """Render a number as a whole number for the compact sidebar."""
+    if value is None or value == "":
+        return empty
+    try:
+        return f"{round(float(value))}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _short_date(value: Any) -> str:
+    """Return a consistent MM-DD date for compact tables."""
+    text = str(value or "")
+    if len(text) >= 10:
+        return text[5:10]
+    return text or "—"
+
+
+def _tsb_state(tsb: Any) -> str:
+    if tsb is None:
+        return "—"
+    try:
+        value = float(tsb)
+    except (TypeError, ValueError):
+        return "—"
+    if value >= 5:
+        return "✓ fresh"
+    if value >= -10:
+        return "✓ steady"
+    if value >= -25:
+        return "▲ strain"
+    return "✗ over"
+
+
+def _acwr_state(acwr: Any) -> str:
+    if acwr is None:
+        return "—"
+    try:
+        value = float(acwr)
+    except (TypeError, ValueError):
+        return "—"
+    if 0.8 <= value <= 1.3:
+        return "✓ optimal"
+    if value < 0.8:
+        return "▲ under"
+    if value <= 1.5:
+        return "▲ caution"
+    return "✗ high"
+
+
+def _alerts_state(count: Any) -> str:
+    if count is None:
+        return "—"
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        return "—"
+    if value == 0:
+        return "✓ clear"
+    if value <= 2:
+        return "▲ watch"
+    return "✗ act"
+
+
+def _clock_now(now: datetime | None = None) -> str:
+    return (now or datetime.now()).strftime("%H:%M")
+
+
+def _table_cell(
+    value: Any, *, width: int | None = None, right: bool = False
+) -> Text:
+    """A single-line table cell that ellipsizes instead of hard-truncating."""
+    text = str(value if value is not None and value != "" else "—")
+    if right and width is not None and len(text) < width:
+        text = text.rjust(width)
+    cell = Text(text)
+    cell.no_wrap = True
+    cell.overflow = "ellipsis"
+    return cell
 
 
 @dataclass
@@ -167,26 +281,34 @@ def format_confirmation_result_markdown(
     """Format the result of an approved mutating action as Markdown."""
     status = result.get("status", "unknown")
     if status == "failed" or "error" in result:
-        return f"**Failed (`{pending.action}`)**: {result.get('error', 'Unknown error')}"
+        return (
+            f"**Failed (`{pending.action}`)**: "
+            f"{_fmt(result.get('error'), empty='Unknown error')}"
+        )
     if status == "uploaded":
         events = result.get("events") or []
         lines = [
-            f"**Uploaded {result.get('uploaded_count', len(events))} Workout(s) to Intervals.icu**",
+            f"**Uploaded {_fmt(result.get('uploaded_count', len(events)))} Workout(s) to Intervals.icu**",
         ]
         for ev in events[:10]:
             if isinstance(ev, dict):
+                date_part = str(ev.get("start_date_local") or "")[:10] or "—"
                 lines.append(
-                    f"- `{ev.get('start_date_local', '')[:10]}` **{ev.get('name', 'Workout')}** (`{ev.get('type', '')}`)"
+                    f"- `{date_part}` **{ev.get('name') or 'Workout'}** "
+                    f"(`{ev.get('type') or '—'}`)"
                 )
         return "\n".join(lines)
     if status == "deleted":
-        return f"**Deleted Event** `{result.get('event_id')}` — {pending.summary}"
+        return f"**Deleted Event** `{_fmt(result.get('event_id'))}` — {pending.summary}"
     if status == "updated":
-        return f"**Updated Event** `{result.get('event_id')}` — {pending.summary}"
+        return f"**Updated Event** `{_fmt(result.get('event_id'))}` — {pending.summary}"
     if status == "saved":
-        return f"**Saved {result.get('saved_count', 0)} Workout(s)** to Library"
+        return f"**Saved {_fmt(result.get('saved_count', 0))} Workout(s)** to Library"
     if status == "applied":
-        return f"**Applied Plan** `{result.get('folder_id')}` starting `{result.get('start_date_local')}`"
+        return (
+            f"**Applied Plan** `{_fmt(result.get('folder_id'))}` "
+            f"starting `{_fmt(result.get('start_date_local'))}`"
+        )
     return f"**Completed (`{pending.action}`)**: {pending.summary}"
 
 
@@ -208,7 +330,7 @@ def format_status_markdown(
     ]
     if profile:
         lines.append(
-            f"Athlete: **{profile.get('name', 'Athlete')}** (`{profile.get('icu_resting_hr', '—')} bpm`)"
+            f"Athlete: **{profile.get('name') or 'Athlete'}** (`{_fmt(profile.get('icu_resting_hr'))} bpm`)"
         )
     elif error:
         lines.append(f"Intervals.icu: {error}")
@@ -217,65 +339,116 @@ def format_status_markdown(
     return "\n\n".join(lines)
 
 
-def format_readiness_sidebar_markdown(report: dict[str, Any]) -> str:
-    """Render compact readiness and polarization metrics for the sidebar."""
+def format_readiness_sidebar_markdown(
+    report: dict[str, Any], as_of: str | None = None
+) -> str:
+    """Render compact readiness and polarization metrics for the sidebar.
+
+    Values are laid out one metric per row in a monospace block so the sidebar
+    never collapses them into a single wrapped paragraph.
+    """
     if not report or "error" in report:
         err = report.get("error", "No data") if isinstance(report, dict) else "No data"
         return f"**Readiness Snapshot**\n\n*{err}*"
 
-    lf = report.get("load_and_form", {})
-    rw = report.get("recovery_and_wellness", {})
-    rs = report.get("running_summary", {})
-    ss = report.get("strength_summary", {})
-    audit = report.get("concurrent_interference_audit", {})
-    dist = rs.get("intensity_distribution_3_zone", {})
-    hrv = rw.get("hrv", {})
-    rhr = rw.get("resting_hr", {})
-    sleep = rw.get("sleep_and_subjective", {})
+    lf = report.get("load_and_form") or {}
+    rw = report.get("recovery_and_wellness") or {}
+    rs = report.get("running_summary") or {}
+    ss = report.get("strength_summary") or {}
+    audit = report.get("concurrent_interference_audit") or {}
+    dist = rs.get("intensity_distribution_3_zone") or {}
+    hrv = rw.get("hrv") or {}
+    rhr = rw.get("resting_hr") or {}
+    sleep = rw.get("sleep_and_subjective") or {}
 
-    days = report.get("analysis_window_days", 28)
-    return (
-        f"**Readiness ({days}d)**\n\n"
-        f"CTL `{lf.get('ctl_fitness', '—')}` · ATL `{lf.get('atl_fatigue', '—')}` · TSB **`{lf.get('tsb_form', '—')}`**\n"
-        f"ACWR `{lf.get('acwr_ratio', '—')}`\n"
-        f"HRV `{hrv.get('rolling_7d_mean', '—')}` / `{hrv.get('baseline_mean', '—')}` ms\n"
-        f"RHR `{rhr.get('latest_rhr_bpm', '—')}` bpm · Sleep `{sleep.get('rolling_7d_avg_hours', '—')}h`\n"
-        f"Run `{rs.get('weekly_avg_distance_km', '—')} km/wk` ({rs.get('sessions_per_week', '—')}/wk)\n"
-        f"Z1-2 `{dist.get('zone_1_2_low_pct', 0)}%` · Z3 `{dist.get('zone_3_moderate_grey_zone_pct', 0)}%` · Z4-5 `{dist.get('zone_4_5_high_pct', 0)}%`\n"
-        f"Strength `{ss.get('total_sessions', 0)}` ({ss.get('sessions_per_week', 0)}/wk) · Alerts `{audit.get('warnings_count', 0)}`"
+    days = report.get("analysis_window_days") or 28
+    hrv_mean = hrv.get("rolling_7d_mean")
+    hrv_base = hrv.get("baseline_mean")
+    has_hrv = hrv_mean is not None or hrv_base is not None
+    hrv_value = f"{_fmt(hrv_mean)}/{_fmt(hrv_base)} ms" if has_hrv else "—"
+    zones = (
+        f"{_whole(dist.get('zone_1_2_low_pct', 0))}/"
+        f"{_whole(dist.get('zone_3_moderate_grey_zone_pct', 0))}/"
+        f"{_whole(dist.get('zone_4_5_high_pct', 0))}%"
+    )
+    strength = (
+        f"{_fmt(ss.get('total_sessions', 0))} "
+        f"({_whole(ss.get('sessions_per_week', 0))}/wk)"
     )
 
+    rows = [
+        ("CTL", _fmt(lf.get("ctl_fitness")), ""),
+        ("ATL", _fmt(lf.get("atl_fatigue")), ""),
+        ("TSB", _fmt(lf.get("tsb_form")), _tsb_state(lf.get("tsb_form"))),
+        ("ACWR", _fmt(lf.get("acwr_ratio")), _acwr_state(lf.get("acwr_ratio"))),
+        ("HRV", hrv_value, "" if has_hrv else "no data"),
+        ("RHR", _fmt(rhr.get("latest_rhr_bpm"), " bpm"), ""),
+        ("Sleep", _fmt(sleep.get("rolling_7d_avg_hours"), " h"), ""),
+        ("Run", _fmt(rs.get("weekly_avg_distance_km"), " km/wk"), ""),
+        ("Zones", zones, ""),
+        ("Strength", strength, ""),
+        ("Alerts", _fmt(audit.get("warnings_count", 0)), _alerts_state(audit.get("warnings_count", 0))),
+    ]
+    body = "\n".join(
+        f"{label:<8}{value:>10} {state}".rstrip() for label, value, state in rows
+    )
+    timestamp = as_of or _clock_now()
+    md = (
+        f"**Readiness ({days}d)** · as of {timestamp}\n\n"
+        "```text\n"
+        f"{body}\n"
+        "```"
+    )
+    if not has_hrv:
+        md += (
+            "\n\n*No HRV data in this window — readiness uses load, RHR and sleep only.*"
+        )
+    return md
 
-def format_analytics_dashboard_markdown(report: dict[str, Any]) -> str:
+
+def format_analytics_dashboard_markdown(
+    report: dict[str, Any], as_of: str | None = None
+) -> str:
     """Render quantitative analysis report for the Analytics tab and `/analyze`."""
     if not report or "error" in report:
         err = report.get("error", "Intervals.icu credentials not configured.")
         return f"### Analytics Unavailable\n{err}"
 
-    days = report.get("analysis_window_days", 28)
-    lf = report.get("load_and_form", {})
-    rw = report.get("recovery_and_wellness", {})
-    rs = report.get("running_summary", {})
-    ss = report.get("strength_summary", {})
-    audit = report.get("concurrent_interference_audit", {})
-    dist = rs.get("intensity_distribution_3_zone", {})
-    hrv = rw.get("hrv", {})
-    rhr = rw.get("resting_hr", {})
-    sleep = rw.get("sleep_and_subjective", {})
+    days = report.get("analysis_window_days") or 28
+    lf = report.get("load_and_form") or {}
+    rw = report.get("recovery_and_wellness") or {}
+    rs = report.get("running_summary") or {}
+    ss = report.get("strength_summary") or {}
+    audit = report.get("concurrent_interference_audit") or {}
+    dist = rs.get("intensity_distribution_3_zone") or {}
+    hrv = rw.get("hrv") or {}
+    rhr = rw.get("resting_hr") or {}
+    sleep = rw.get("sleep_and_subjective") or {}
+    warnings = audit.get("warnings_count", 0)
+    timestamp = as_of or _clock_now()
 
     md = (
-        f"### Load & Form ({days}d)\n"
-        f"- **CTL**: `{lf.get('ctl_fitness')}` · **ATL**: `{lf.get('atl_fatigue')}` · **TSB**: `{lf.get('tsb_form')}`\n"
-        f"- **ACWR**: `{lf.get('acwr_ratio')}` — *{lf.get('acwr_interpretation')}*\n\n"
+        f"### Load & Form ({days}d) · as of {timestamp}\n"
+        f"- **CTL**: `{_fmt(lf.get('ctl_fitness'))}` · **ATL**: `{_fmt(lf.get('atl_fatigue'))}` · "
+        f"**TSB**: `{_fmt(lf.get('tsb_form'))}` *{_tsb_state(lf.get('tsb_form'))}*\n"
+        f"- **ACWR**: `{_fmt(lf.get('acwr_ratio'))}` *{_acwr_state(lf.get('acwr_ratio'))}* — "
+        f"{_fmt(lf.get('acwr_interpretation'))}\n\n"
         f"### Autonomic Readiness\n"
-        f"- **HRV**: `{hrv.get('latest_hrv_rmssd')}` ms (7d `{hrv.get('rolling_7d_mean')}` vs base `{hrv.get('baseline_mean')}`, CV `{hrv.get('rolling_7d_cv_pct')}%`)\n"
-        f"- **RHR**: `{rhr.get('latest_rhr_bpm')}` bpm (7d `{rhr.get('rolling_7d_mean_bpm')}`) · **Sleep**: `{sleep.get('rolling_7d_avg_hours')}` h\n\n"
+        f"- **HRV**: `{_fmt(hrv.get('latest_hrv_rmssd'))} ms` "
+        f"(7d `{_fmt(hrv.get('rolling_7d_mean'))}` vs base `{_fmt(hrv.get('baseline_mean'))}`, "
+        f"CV `{_fmt(hrv.get('rolling_7d_cv_pct'))}%`)\n"
+        f"- **RHR**: `{_fmt(rhr.get('latest_rhr_bpm'))} bpm` (7d `{_fmt(rhr.get('rolling_7d_mean_bpm'))}`) · "
+        f"**Sleep**: `{_fmt(sleep.get('rolling_7d_avg_hours'))} h`\n\n"
         f"### Running & Polarization\n"
-        f"- **Volume**: `{rs.get('weekly_avg_distance_km')} km/wk` across `{rs.get('total_sessions')}` sessions (`{rs.get('sessions_per_week')}/wk`)\n"
-        f"- **Zones**: Low `{dist.get('zone_1_2_low_pct')}%` · Mod `{dist.get('zone_3_moderate_grey_zone_pct')}%` · High `{dist.get('zone_4_5_high_pct')}%` (PI `{dist.get('polarization_index')}`)\n\n"
+        f"- **Volume**: `{_fmt(rs.get('weekly_avg_distance_km'))} km/wk` across "
+        f"`{_fmt(rs.get('total_sessions'))}` sessions (`{_fmt(rs.get('sessions_per_week'))}/wk`)\n"
+        f"- **Zones**: Low `{_fmt(dist.get('zone_1_2_low_pct'))}%` · "
+        f"Mod `{_fmt(dist.get('zone_3_moderate_grey_zone_pct'))}%` · "
+        f"High `{_fmt(dist.get('zone_4_5_high_pct'))}%` (PI `{_fmt(dist.get('polarization_index'))}`)\n\n"
         f"### Strength & Spacing\n"
-        f"- **Sessions**: `{ss.get('total_sessions')}` (`{ss.get('sessions_per_week')}/wk`, `{ss.get('total_duration_hours')} h`)\n"
-        f"- **Interference Alerts**: `{audit.get('warnings_count', 0)}`"
+        f"- **Sessions**: `{_fmt(ss.get('total_sessions'))}` "
+        f"(`{_fmt(ss.get('sessions_per_week'))}/wk`, `{_fmt(ss.get('total_duration_hours'))} h`)\n"
+        f"- **Interference Alerts**: `{_fmt(warnings)}` *{_alerts_state(warnings)}*"
     )
     if audit.get("warnings"):
         md += "\n" + "\n".join(f"  - {w}" for w in audit["warnings"])
@@ -292,12 +465,12 @@ def format_calendar_sidebar_markdown(calendar_data: dict[str, Any]) -> str:
     if not events:
         return "**Upcoming (14d)**\n\n*No planned workouts.*"
 
-    lines = [f"**Upcoming ({len(events)})**\n"]
+    lines = [f"**Upcoming (14d)** · {len(events)} planned\n"]
     for ev in events[:6]:
-        date_str = str(ev.get("start_date_local") or "")[5:10]
-        sport = ev.get("type") or ev.get("category") or ""
+        date_str = _short_date(ev.get("start_date_local"))
+        sport = ev.get("type") or ev.get("category") or "—"
         name = ev.get("name") or "Untitled"
-        lines.append(f"`{date_str}` {name} *({sport})*")
+        lines.append(f"`{date_str}` **{name}** *({sport})*")
     if len(events) > 6:
         lines.append(f"*+{len(events) - 6} more*")
     return "\n".join(lines)
@@ -313,17 +486,46 @@ def format_library_markdown(
 
     folders = library_data.get("folders") or []
     workouts = library_data.get("workouts") or []
-    lines = [f"### Library ({len(folders)} Folders, {len(workouts)} Workouts)"]
+    total_workouts = len(workouts)
+    shown_workouts = workouts[:15]
+    lines = [
+        "### Library",
+        f"**{len(folders)} {'folder' if len(folders) == 1 else 'folders'} · "
+        f"{total_workouts} {'workout' if total_workouts == 1 else 'workouts'}**",
+    ]
     if plan_data and isinstance(plan_data, dict) and not plan_data.get("error"):
-        plan_name = plan_data.get("training_plan_alias") or plan_data.get("name") or plan_data.get("id")
+        plan_name = (
+            plan_data.get("training_plan_alias")
+            or plan_data.get("name")
+            or plan_data.get("id")
+        )
         if plan_name:
-            lines.append(f"Active Plan: `{plan_name}`")
+            lines.append(f"Active plan: **{plan_name}**")
 
-    for f in folders[:10]:
-        lines.append(f"- **[{f.get('id')}] {f.get('name')}** ({f.get('num_workouts', 0)} workouts)")
-    for w in workouts[:15]:
-        mins = round(float(w["moving_time"]) / 60) if w.get("moving_time") else "—"
-        lines.append(f"- {w.get('name')} (`{w.get('type', 'Run')}`, {mins}m)")
+    if folders:
+        lines.append("\n#### Folders")
+        for f in folders[:10]:
+            name = f.get("name") or "Untitled folder"
+            count = _fmt(f.get("num_workouts", 0))
+            folder_id = f.get("id")
+            suffix = f" · `#{folder_id}`" if folder_id is not None else ""
+            lines.append(f"- **{name}** — {count} workouts{suffix}")
+
+    if workouts:
+        lines.append(f"\n#### Workouts · showing {len(shown_workouts)} of {total_workouts}")
+        for w in shown_workouts:
+            name = w.get("name") or "Untitled workout"
+            sport = w.get("type") or "Workout"
+            mins = (
+                f"{round(float(w['moving_time']) / 60)} min"
+                if w.get("moving_time")
+                else "— min"
+            )
+            lines.append(f"- **{name}** *({sport} · {mins})*")
+        if total_workouts > len(shown_workouts):
+            lines.append(
+                f"\n*+{total_workouts - len(shown_workouts)} more workouts in the library.*"
+            )
     if not folders and not workouts:
         lines.append("*Empty*")
     return "\n".join(lines)
@@ -340,11 +542,25 @@ def format_evidence_markdown(
             return f"### Search: `{query}`\n*No peer-reviewed papers found.*"
         lines = [f"### Literature Results: `{query}`\n"]
         for idx, p in enumerate(papers, start=1):
+            title = p.get("title") or "Untitled"
+            authors = p.get("authors") or "N/A"
+            year = _fmt(p.get("year"), empty="n.d.")
+            journal = p.get("journal") or "N/A"
+            pmid = p.get("pmid")
+            doi = p.get("doi")
+            identifiers = []
+            if pmid:
+                identifiers.append(f"PMID `{pmid}`")
+            if doi:
+                identifiers.append(f"DOI `{doi}`")
+            summary = str(p.get("abstract") or "").strip().replace("\n", " ")
+            if len(summary) > 320:
+                summary = summary[:320].rstrip() + "…"
             lines.append(
-                f"**{idx}. {p.get('title', 'Untitled')}**\n"
-                f"{p.get('authors', 'N/A')} ({p.get('year', 'N/A')}) · *{p.get('journal', 'N/A')}* · "
-                f"PMID `{p.get('pmid', 'N/A')}` · DOI `{p.get('doi', 'N/A')}`\n\n"
-                f"{str(p.get('abstract') or '')[:600]}...\n"
+                f"#### {idx}. {title}\n\n"
+                f"{authors} · {year} · *{journal}*\n\n"
+                f"{' · '.join(identifiers) if identifiers else 'No identifier'}\n\n"
+                f"{summary or '*No abstract available.*'}\n"
             )
         return "\n".join(lines)
 
@@ -353,11 +569,20 @@ def format_evidence_markdown(
 
     lines = ["### Curated Sports Science Evidence\n"]
     for cat, citations in curated.items():
-        lines.append(f"#### `{cat}`")
+        label = CURATED_CATEGORY_LABELS.get(cat, cat.replace("_", " ").title())
+        lines.append(f"#### {label}")
         for c in citations:
+            title = c.get("title") or "Untitled"
+            authors = c.get("authors") or "N/A"
+            year = _fmt(c.get("year"), empty="n.d.")
+            journal = c.get("journal") or "N/A"
+            pmid = c.get("pmid")
+            application = c.get("practical_application") or "No application note."
             lines.append(
-                f"- **{c.get('authors')} ({c.get('year')})** — *{c.get('title')}*\n"
-                f"  PMID `{c.get('pmid')}` · {c.get('practical_application')}\n"
+                f"**{title}**\n\n"
+                f"{authors} · {year} · *{journal}*\n\n"
+                f"PMID `{_fmt(pmid)}`\n\n"
+                f"*Application:* {application}\n"
             )
     return "\n".join(lines)
 
@@ -381,57 +606,91 @@ class ChatMessageCard(Container):
         yield Markdown(self._body_markdown, classes="chat-card-body")
 
 
+class StatusOverlay(Static):
+    """Full-screen overlay used when the terminal is below the minimum size."""
+
+    can_focus = True
+
+
 class ConfirmationBanner(Container):
-    """Compact inline confirmation bar shown when a mutating tool needs approval."""
+    """Inline confirmation bar shown when a mutating tool needs approval."""
+
+    can_focus = True
+
+    BINDINGS = [
+        Binding("a", "approve", "Approve", show=False),
+        Binding("r", "reject", "Reject", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="confirmation-inner"):
-            yield Static("", id="confirmation-summary")
+        yield Static("", id="confirmation-summary")
+        with Horizontal(id="confirmation-actions"):
             yield Button("Approve", id="btn-approve-confirm", variant="success")
             yield Button("Reject", id="btn-reject-confirm", variant="error")
+            yield Static("a approve · r reject", id="confirmation-hint")
+
+    def action_approve(self) -> None:
+        self.app.run_worker(self.app.approve_pending_confirmations())
+
+    def action_reject(self) -> None:
+        self.app.run_worker(self.app.reject_pending_confirmations())
 
 
-KINESIS_MONO_RED_THEME = Theme(
-    name="kinesis-mono-red",
-    primary="#f28b82",
-    secondary="#c96f69",
-    accent="#ffb4ab",
-    foreground="#f2dede",
-    background="#0d0809",
-    surface="#140c0e",
-    panel="#1c1113",
-    warning="#f28b82",
-    error="#e57373",
-    success="#f28b82",
+KINESIS_THEME = Theme(
+    name="kinesis",
+    primary=_PALETTE["accent"],
+    secondary=_PALETTE["focus"],
+    accent=_PALETTE["status"],
+    foreground=_PALETTE["text"],
+    background=_PALETTE["base"],
+    surface=_PALETTE["surface"],
+    panel=_PALETTE["panel"],
+    warning=_PALETTE["warn"],
+    error=_PALETTE["danger"],
+    success=_PALETTE["status"],
     dark=True,
+    variables={
+        "k-base": _PALETTE["base"],
+        "k-panel": _PALETTE["panel"],
+        "k-surface": _PALETTE["surface"],
+        "k-raised": _PALETTE["raised"],
+        "k-text": _PALETTE["text"],
+        "k-muted": _PALETTE["muted"],
+        "k-line": _PALETTE["line"],
+        "k-focus": _PALETTE["focus"],
+        "k-accent": _PALETTE["accent"],
+        "k-status": _PALETTE["status"],
+        "k-warn": _PALETTE["warn"],
+        "k-danger": _PALETTE["danger"],
+    },
 )
 
 
 class KinesisTUI(App[None]):
-    """Minimalistic monochromatic light-red full-screen Textual TUI for Kinesis."""
+    """Minimal full-screen Textual TUI: coach session with a pulse rail."""
 
     TITLE = "kinesis"
 
     CSS = """
     Screen {
-        background: #0d0809;
-        color: #f2dede;
+        background: $k-base;
+        color: $k-text;
     }
 
     #top-bar {
-        height: 3;
-        padding: 0 3;
+        height: 1;
+        margin: 0;
+        padding: 0 2;
         align: left middle;
-        background: #140c0e;
-        border-bottom: solid #2b181b;
-        color: #9e6b70;
+        background: $k-panel;
+        color: $k-muted;
     }
 
     #top-brand {
         width: auto;
         height: 1;
         content-align: left middle;
-        color: #ffb4ab;
+        color: $k-accent;
         text-style: bold;
     }
 
@@ -439,46 +698,53 @@ class KinesisTUI(App[None]):
         width: 1fr;
         height: 1;
         content-align: right middle;
-        color: #b87c82;
+        color: $k-muted;
+        text-overflow: ellipsis;
     }
 
     #main-tabs {
         height: 1fr;
-        background: #0d0809;
+        background: $k-base;
     }
 
     Tabs {
-        height: 3;
+        height: 2;
         padding: 0 2;
-        background: #110a0c;
-        border-bottom: solid #241417;
+        background: $k-panel;
+        border: none;
     }
 
     Tab {
-        height: 3;
+        height: 1;
         padding: 0 3;
         content-align: center middle;
-        color: #85585c;
+        color: $k-muted;
         background: transparent;
     }
 
     Tab:hover {
-        color: #e6c3c3;
+        color: $k-text;
+        background: $k-raised;
     }
 
     Tab.-active {
-        color: #ffb4ab;
-        text-style: bold;
+        color: $k-accent;
+        text-style: bold underline;
+        background: $k-surface;
+    }
+
+    Underline {
+        height: 1;
     }
 
     Underline > .underline--bar {
-        color: #f28b82;
-        background: #2b181b;
+        color: $k-accent;
+        background: $k-panel;
     }
 
     TabPane {
         padding: 0;
-        background: #0d0809;
+        background: $k-base;
     }
 
     #chat-workspace {
@@ -488,14 +754,14 @@ class KinesisTUI(App[None]):
     #chat-main {
         width: 1fr;
         height: 1fr;
-        padding: 0 3;
+        padding: 0 2;
     }
 
     #chat-scroll {
         height: 1fr;
-        padding: 1 0;
+        padding: 0;
         border: none;
-        background: #0d0809;
+        background: $k-base;
     }
 
     .chat-card {
@@ -503,162 +769,171 @@ class KinesisTUI(App[None]):
         margin: 0 0 1 0;
         padding: 0 0 0 2;
         border: none;
-        border-left: thick #b8645e;
+        border-left: solid $k-accent;
         background: transparent;
     }
 
     .chat-card-title {
         text-style: bold;
-        color: #b8645e;
+        color: $k-muted;
         margin-bottom: 0;
     }
 
-    .role-user {
-        border-left: thick #ffb4ab;
-    }
-    .role-user .chat-card-title {
-        color: #ffb4ab;
-    }
+    .role-user { border-left: solid $k-text; }
+    .role-user .chat-card-title { color: $k-text; }
 
-    .agent-analyst {
-        border-left: thick #e57373;
-    }
-    .agent-analyst .chat-card-title {
-        color: #e57373;
-    }
+    .agent-analyst { border-left: solid $k-focus; }
+    .agent-analyst .chat-card-title { color: $k-focus; }
 
-    .agent-researcher {
-        border-left: thick #c96f69;
-    }
-    .agent-researcher .chat-card-title {
-        color: #c96f69;
-    }
+    .agent-researcher { border-left: solid $k-status; }
+    .agent-researcher .chat-card-title { color: $k-status; }
 
-    .agent-planner {
-        border-left: thick #f28b82;
-    }
-    .agent-planner .chat-card-title {
-        color: #f28b82;
-    }
+    .agent-planner { border-left: solid $k-accent; }
+    .agent-planner .chat-card-title { color: $k-accent; }
 
-    .role-system {
-        border-left: thick #9e6b70;
-    }
-    .role-system .chat-card-title {
-        color: #9e6b70;
-    }
+    .role-system { border-left: solid $k-line; }
+    .role-system .chat-card-title { color: $k-muted; }
 
     .tool-strip {
         height: auto;
-        color: #85585c;
+        color: $k-muted;
         padding: 0 0 0 2;
         margin: 0 0 1 0;
     }
 
     #agent-activity-bar {
-        height: auto;
-        min-height: 1;
+        height: 1;
         padding: 0 1;
-        margin: 0 0 1 0;
-        color: #c96f69;
+        margin: 0;
+        color: $k-muted;
+        text-overflow: ellipsis;
     }
 
     #confirmation-bar {
         display: none;
         height: auto;
+        max-height: 3;
         margin: 0 0 1 0;
-        padding: 1 2;
-        border-left: thick #ffb4ab;
-        background: #1a1012;
+        padding: 0 1;
+        border-left: solid $k-warn;
+        background: $k-surface;
     }
 
     #confirmation-bar.visible {
         display: block;
     }
 
-    #confirmation-inner {
-        height: auto;
-        align: left middle;
+    #confirmation-bar:focus {
+        border-left: solid $k-focus;
     }
 
     #confirmation-summary {
         width: 1fr;
-        color: #ffb4ab;
-        padding: 0 2 0 0;
+        height: 2;
+        color: $k-text;
+        text-overflow: ellipsis;
     }
 
-    #confirmation-inner Button {
-        min-width: 12;
-        height: 3;
-        margin-left: 1;
-    }
-
-    Button, Button.-style-default {
-        min-width: 11;
-        height: 3;
-        background: #1c1113;
-        color: #c98a8e;
-        border: none;
-        border-top: tall #2b181b;
-        border-bottom: tall #0d0809;
-    }
-
-    Button:hover, Button:focus, Button.-style-default:hover, Button.-style-default:focus {
-        background: #2b181b;
-        color: #ffb4ab;
-        border-top: tall #f28b82;
-        border-bottom: tall #1c1113;
-    }
-
-    Button.-primary, Button.-success, Button.-style-default.-primary, Button.-style-default.-success, Button.active-window {
-        background: #331b1f;
-        color: #ffb4ab;
-        border-top: tall #f28b82;
-        border-bottom: tall #241215;
-        text-style: bold;
-    }
-
-    Button.-error, Button.-style-default.-error {
-        background: #1c1113;
-        color: #c96f69;
-        border-top: tall #5c3236;
-        border-bottom: tall #0d0809;
-    }
-
-    #chat-input-bar {
-        height: 5;
-        padding: 1 0;
+    #confirmation-actions {
+        height: 1;
         align: left middle;
     }
 
-    #mode-select {
-        display: none;
+    #confirmation-actions Button {
+        min-width: 9;
+        height: 1;
+        margin-right: 1;
+    }
+
+    #confirmation-hint {
+        width: auto;
+        height: 1;
+        color: $k-muted;
+        content-align: left middle;
+    }
+
+    Button {
+        min-width: 8;
+        height: 1;
+        padding: 0 1;
+        background: $k-surface;
+        color: $k-text;
+        border: none;
+    }
+
+    Button:hover, Button:focus {
+        background: $k-raised;
+        color: $k-text;
+    }
+
+    Button:disabled {
+        background: $k-panel;
+        color: $k-muted;
+    }
+
+    Button.-primary {
+        background: $k-accent;
+        color: $k-base;
+        text-style: bold;
+    }
+
+    Button.-success {
+        background: $k-status;
+        color: $k-base;
+        text-style: bold;
+    }
+
+    Button.-error {
+        background: transparent;
+        color: $k-danger;
+    }
+
+    Button.-error:hover, Button.-error:focus {
+        background: $k-danger;
+        color: $k-base;
+    }
+
+    #chat-input-bar {
+        height: 3;
+        padding: 0;
+        align: left middle;
+    }
+
+    #mode-chip {
+        width: 7;
+        height: 3;
+        margin: 0 1 0 0;
+        content-align: center middle;
+        color: $k-muted;
+        background: $k-surface;
+    }
+
+    #mode-chip.plan {
+        color: $k-base;
+        background: $k-accent;
+        text-style: bold;
     }
 
     #chat-input, #evidence-query-input {
         width: 1fr;
         height: 3;
         padding: 0 2;
-        border: round #4a292e;
-        background: #140c0e;
-        color: #f2dede;
+        border: round $k-line;
+        background: $k-surface;
+        color: $k-text;
     }
 
     #chat-input:focus, #evidence-query-input:focus {
-        border: round #f28b82;
-        background: #180e11;
-    }
-
-    #btn-send {
-        display: none;
+        border: round $k-focus;
+        background: $k-surface;
     }
 
     #sidebar {
         width: 36;
         height: 1fr;
-        border-left: solid #2b181b;
+        border-left: solid $k-line;
         padding: 1 2;
-        background: #110a0c;
+        background: $k-panel;
     }
 
     #sidebar.hidden {
@@ -670,46 +945,72 @@ class KinesisTUI(App[None]):
         margin: 0 0 1 0;
         padding: 0 0 1 0;
         border: none;
-        border-bottom: solid #2b181b;
+        border-bottom: solid $k-line;
         background: transparent;
     }
 
     #sidebar-pipeline {
-        color: #9e6b70;
+        color: $k-muted;
+    }
+
+    #sidebar-readiness MarkdownFence {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+    }
+
+    #sidebar-readiness MarkdownFence > Label {
+        padding: 0;
+        color: $k-text;
     }
 
     .tab-toolbar {
-        height: 5;
-        padding: 1 3;
+        height: 2;
+        padding: 0 2;
         align: left middle;
-        background: #140c0e;
-        border-bottom: solid #241417;
+        background: $k-panel;
+        border-bottom: solid $k-line;
     }
 
     .tab-toolbar Button {
         margin-right: 1;
-        min-width: 10;
     }
 
     .tab-toolbar Button.day-btn {
-        min-width: 7;
+        min-width: 5;
+    }
+
+    .tab-toolbar Select, .tab-toolbar Input {
+        height: 1;
+        border: none;
+        background: $k-surface;
+        color: $k-text;
+        padding: 0 1;
+        margin-right: 1;
+    }
+
+    .tab-toolbar Input#evidence-query-input {
+        height: 1;
+        border: none;
+        background: $k-surface;
+        padding: 0 1;
     }
 
     #analytics-status {
         width: 1fr;
-        height: 3;
+        height: 1;
         content-align: right middle;
-        color: #c96f69;
+        color: $k-muted;
         padding: 0 1;
     }
 
     #analytics-body, #calendar-body {
         height: 1fr;
-        padding: 1 3;
+        padding: 1 2;
     }
 
     #analytics-report-scroll {
-        width: 3fr;
+        width: 1fr;
         height: 1fr;
         padding: 0 2 0 0;
     }
@@ -719,8 +1020,8 @@ class KinesisTUI(App[None]):
         height: auto;
         margin: 0 0 1 0;
         padding: 1 2;
-        border-left: thick #ffb4ab;
-        background: #160d0f;
+        border-left: solid $k-focus;
+        background: $k-surface;
     }
 
     #analytics-ai-markdown.visible {
@@ -728,9 +1029,9 @@ class KinesisTUI(App[None]):
     }
 
     #analytics-activities-pane {
-        width: 2fr;
+        width: 1fr;
         height: 1fr;
-        border-left: solid #2b181b;
+        border-left: solid $k-line;
         padding: 0 0 0 2;
     }
 
@@ -740,8 +1041,9 @@ class KinesisTUI(App[None]):
     }
 
     #activity-detail-scroll {
+        width: 1fr;
         height: 9;
-        border-top: solid #2b181b;
+        border-top: solid $k-line;
         padding: 1 0;
     }
 
@@ -756,72 +1058,101 @@ class KinesisTUI(App[None]):
         margin-bottom: 1;
     }
 
-    DataTable {
-        background: #0d0809;
-        color: #e6c3c3;
-    }
-
-    DataTable > .datatable--header {
-        background: #1a1012;
-        color: #ffb4ab;
-        text-style: bold;
-    }
-
-    DataTable > .datatable--cursor {
-        background: #331c20;
-        color: #ffb4ab;
-    }
-
     #calendar-detail-scroll {
+        width: 1fr;
         height: 10;
-        border-top: solid #2b181b;
+        border-top: solid $k-line;
         padding: 1 0;
     }
 
     #library-pane {
         width: 2fr;
         height: 1fr;
-        border-left: solid #2b181b;
+        border-left: solid $k-line;
         padding: 0 0 0 2;
+    }
+
+    .pane-hidden {
+        display: none;
     }
 
     .pane-title {
         text-style: bold;
-        color: #c96f69;
+        color: $k-text;
         margin-bottom: 1;
     }
 
     #evidence-topic-select {
         width: 28;
-        margin-right: 1;
+    }
+
+    Screen.narrow #evidence-topic-select {
+        width: 16;
     }
 
     #evidence-scroll {
         height: 1fr;
-        padding: 1 3;
+        padding: 1 2;
+    }
+
+    DataTable {
+        background: $k-base;
+        color: $k-text;
+        overflow-x: hidden;
+    }
+
+    DataTable > .datatable--header {
+        background: $k-surface;
+        color: $k-text;
+        text-style: bold;
+    }
+
+    DataTable > .datatable--cursor {
+        background: $k-raised;
+        color: $k-text;
     }
 
     #bottom-bar {
-        height: 3;
-        padding: 0 3;
+        height: 1;
+        padding: 0 2;
         align: left middle;
-        background: #140c0e;
-        border-top: solid #2b181b;
-        color: #9e6b70;
+        background: $k-panel;
+        color: $k-muted;
     }
 
     #bottom-hints {
         width: 1fr;
         height: 1;
         content-align: left middle;
-        color: #9e6b70;
+        color: $k-muted;
+        text-overflow: ellipsis;
     }
 
     #bottom-keys {
         width: auto;
         height: 1;
+        padding-left: 2;
         content-align: right middle;
-        color: #b87c82;
+        color: $k-muted;
+    }
+
+    #too-small {
+        display: none;
+        width: 1fr;
+        height: 1fr;
+        content-align: center middle;
+        background: $k-base;
+        color: $k-text;
+    }
+
+    Screen.too-small #top-bar,
+    Screen.too-small #main-tabs,
+    Screen.too-small #bottom-bar {
+        display: none;
+    }
+
+    Screen.too-small #too-small {
+        display: block;
     }
     """
 
@@ -829,11 +1160,21 @@ class KinesisTUI(App[None]):
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+r", "refresh_data", "Refresh", show=True),
         Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("1", "tab_chat", "Chat", show=False),
+        Binding("2", "tab_analytics", "Analytics", show=False),
+        Binding("3", "tab_calendar", "Calendar", show=False),
+        Binding("4", "tab_evidence", "Evidence", show=False),
+        Binding("ctrl+1", "tab_chat", "Chat", show=False),
+        Binding("ctrl+2", "tab_analytics", "Analytics", show=False),
+        Binding("ctrl+3", "tab_calendar", "Calendar", show=False),
+        Binding("ctrl+4", "tab_evidence", "Evidence", show=False),
         Binding("f1", "tab_chat", "Chat", show=False),
         Binding("f2", "tab_analytics", "Analytics", show=False),
         Binding("f3", "tab_calendar", "Calendar", show=False),
         Binding("f4", "tab_evidence", "Evidence", show=False),
         Binding("ctrl+p", "quick_plan", "Plan", show=False),
+        Binding("escape", "stop_turn", "Stop", show=False),
+        Binding("q", "quit_small", "Quit", show=False),
         Binding("ctrl+q", "quit", "Quit", show=True),
     ]
 
@@ -844,8 +1185,8 @@ class KinesisTUI(App[None]):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.register_theme(KINESIS_MONO_RED_THEME)
-        self.theme = "kinesis-mono-red"
+        self.register_theme(KINESIS_THEME)
+        self.theme = "kinesis"
         self._graph = graph
         self._auto_refresh_on_mount = auto_refresh_on_mount
         self.conversation_messages: list[AnyMessage] = []
@@ -853,7 +1194,17 @@ class KinesisTUI(App[None]):
         self.analytics_days: int = 28
         self._activities_cache: list[dict[str, Any]] = []
         self._calendar_events_cache: list[dict[str, Any]] = []
+        self._activities_name_key: Any = None
+        self._calendar_name_key: Any = None
         self._is_busy: bool = False
+        self._mode: str = "auto"
+        self._queued_messages: list[str] = []
+        self._evidence_initialized: bool = False
+        self._sidebar_override: bool | None = None
+        self._is_too_small: bool = False
+        self._thinking_started: float = 0.0
+        self._thinking_timer: Any = None
+        self._busy_task: asyncio.Task[Any] | None = None
 
     def _get_graph(self) -> Any:
         if self._graph is None:
@@ -862,8 +1213,8 @@ class KinesisTUI(App[None]):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
-            yield Static("⚡ kinesis", id="top-brand")
-            yield Static("ctrl+b sidebar · /plan · /analyze · /evidence", id="top-telemetry")
+            yield Static("// kinesis", id="top-brand")
+            yield Static("syncing...", id="top-telemetry")
 
         with TabbedContent(id="main-tabs"):
             with TabPane("Chat", id="tab-chat"):
@@ -879,22 +1230,11 @@ class KinesisTUI(App[None]):
                         yield Static("", id="agent-activity-bar")
                         yield ConfirmationBanner(id="confirmation-bar")
                         with Horizontal(id="chat-input-bar"):
-                            yield Select(
-                                options=[
-                                    ("auto", "auto"),
-                                    ("plan", "plan"),
-                                    ("analyze", "analyze"),
-                                    ("research", "research"),
-                                ],
-                                value="auto",
-                                allow_blank=False,
-                                id="mode-select",
-                            )
+                            yield Static("auto", id="mode-chip")
                             yield Input(
-                                placeholder="Ask anything or type /plan, /analyze, /evidence, /clear...",
+                                placeholder="Ask anything",
                                 id="chat-input",
                             )
-                            yield Button("Send", id="btn-send", variant="primary")
                     with VerticalScroll(id="sidebar"):
                         yield Static(
                             "Route: auto",
@@ -930,7 +1270,7 @@ class KinesisTUI(App[None]):
                     yield Button("60d", id="btn-days-60", classes="day-btn")
                     yield Button("90d", id="btn-days-90", classes="day-btn")
                     yield Button("Refresh", id="btn-refresh-analytics")
-                    yield Button("AI Commentary", id="btn-ai-analytics", variant="success")
+                    yield Button("AI Commentary", id="btn-ai-analytics")
                     yield Static("Window: 28d", id="analytics-status")
                 with Horizontal(id="analytics-body"):
                     with VerticalScroll(id="analytics-report-scroll"):
@@ -954,7 +1294,7 @@ class KinesisTUI(App[None]):
             with TabPane("Calendar", id="tab-calendar"):
                 with Horizontal(id="calendar-toolbar", classes="tab-toolbar"):
                     yield Button("Refresh", id="btn-refresh-calendar", variant="primary")
-                    yield Button("+ Plan Workout", id="btn-goto-plan", variant="success")
+                    yield Button("+ Plan Workout", id="btn-goto-plan")
                 with Horizontal(id="calendar-body"):
                     with Vertical(id="calendar-events-pane"):
                         yield Label("Upcoming (14d)", classes="pane-title")
@@ -982,10 +1322,11 @@ class KinesisTUI(App[None]):
                         ],
                         value="all",
                         allow_blank=False,
+                        compact=True,
                         id="evidence-topic-select",
                     )
                     yield Input(
-                        placeholder="Search PubMed / Europe PMC...",
+                        placeholder="Search PubMed",
                         id="evidence-query-input",
                     )
                     yield Button("Search", id="btn-search-evidence", variant="primary")
@@ -997,40 +1338,206 @@ class KinesisTUI(App[None]):
                     )
 
         with Horizontal(id="bottom-bar"):
-            yield Static("/plan · /analyze · /evidence · /status · /clear", id="bottom-hints")
+            yield Static("1-4 tabs", id="bottom-hints")
             yield Static("^b sidebar   ^r refresh   ^l clear   ^q quit", id="bottom-keys")
+
+        yield StatusOverlay("", id="too-small")
 
     async def on_mount(self) -> None:
         activities_table = self.query_one("#activities-table", DataTable)
-        activities_table.add_columns("Date", "Sport", "Name", "km", "Min", "Load")
+        for label, width in (
+            ("Date", 5),
+            ("Sport", 7),
+            ("Name", 20),
+            ("km", 4),
+            ("Min", 3),
+            ("Load", 4),
+        ):
+            key = activities_table.add_column(label, width=width)
+            if label == "Name":
+                self._activities_name_key = key
 
         calendar_table = self.query_one("#calendar-table", DataTable)
-        calendar_table.add_columns("Date", "Type", "Category", "Name", "Min", "Load", "ID")
+        for label, width in (
+            ("Date", 5),
+            ("Type", 7),
+            ("Name", 20),
+            ("Min", 4),
+            ("Load", 5),
+        ):
+            key = calendar_table.add_column(label, width=width)
+            if label == "Name":
+                self._calendar_name_key = key
 
         self.query_one("#chat-input", Input).focus()
-        self._load_curated_evidence("all")
+        self._apply_layout()
 
         if self._auto_refresh_on_mount:
             self.run_worker(self._refresh_all_data_async(), exclusive=False)
+
+    # ------------------------------------------------------------------
+    # Layout, Modes & Busy State
+    # ------------------------------------------------------------------
+    def _apply_layout(self) -> None:
+        """Apply width breakpoints and the too-small state."""
+        try:
+            width, height = self.size.width, self.size.height
+        except Exception:  # noqa: BLE001 - called before the screen is ready
+            return
+        if width <= 0 or height <= 0:
+            return
+
+        was_too_small = self._is_too_small
+        self._is_too_small = width < 60 or height < 24
+        self.screen.set_class(self._is_too_small, "too-small")
+        self.screen.set_class(width < 80, "narrow")
+        if self._is_too_small and not was_too_small:
+            try:
+                self.call_after_refresh(
+                    self.query_one("#too-small", StatusOverlay).focus
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        elif was_too_small and not self._is_too_small:
+            try:
+                self.query_one("#chat-input", Input).focus()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            sidebar = self.query_one("#sidebar", VerticalScroll)
+            show_sidebar = (
+                self._sidebar_override
+                if self._sidebar_override is not None
+                else width >= 100
+            )
+            sidebar.set_class(not show_sidebar, "hidden")
+
+            one_pane = width < 100
+            self.query_one("#analytics-activities-pane").set_class(
+                one_pane, "pane-hidden"
+            )
+            self.query_one("#library-pane").set_class(one_pane, "pane-hidden")
+
+            self.query_one("#too-small", Static).update(
+                f"current {width}×{height} · needs 80×24 · q to quit"
+            )
+        except Exception:  # noqa: BLE001 - before compose has finished
+            return
+
+        if self.pending_confirmations:
+            self._render_confirmation_summary()
+
+        self.call_after_refresh(self._fit_table_columns)
+
+    def _fit_table_columns(self) -> None:
+        """Size the name column to the space left after fixed-width metrics."""
+        try:
+            activities = self.query_one("#activities-table", DataTable)
+            available = activities.size.width
+            if available > 0 and self._activities_name_key is not None:
+                fixed = 5 + 7 + 4 + 3 + 4 + 2 * 6 + 2
+                new_width = max(6, available - fixed)
+                column = activities.columns[self._activities_name_key]
+                if column.width != new_width:
+                    column.width = new_width
+                    activities._require_update_dimensions = True
+                    activities._clear_caches()
+                    activities.refresh(layout=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            calendar = self.query_one("#calendar-table", DataTable)
+            available = calendar.size.width
+            if available > 0 and self._calendar_name_key is not None:
+                fixed = 5 + 7 + 4 + 5 + 2 * 5 + 2
+                new_width = max(6, available - fixed)
+                column = calendar.columns[self._calendar_name_key]
+                if column.width != new_width:
+                    column.width = new_width
+                    calendar._require_update_dimensions = True
+                    calendar._clear_caches()
+                    calendar.refresh(layout=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @on(TabbedContent.TabActivated)
+    def _on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        active = event.tabbed_content.active
+        if active in ("tab-analytics", "tab-calendar"):
+            self.call_after_refresh(self._fit_table_columns)
+        if active == "tab-evidence" and not self._evidence_initialized:
+            self._load_curated_evidence("all")
+
+    def on_resize(self, event: Resize) -> None:
+        self._apply_layout()
+
+    def _set_mode(self, mode: str) -> None:
+        self._mode = mode
+        try:
+            chip = self.query_one("#mode-chip", Static)
+            chip.update(mode)
+            chip.set_class(mode == "plan", "plan")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _thinking_status_text(self) -> str:
+        elapsed = int(max(0.0, time.monotonic() - self._thinking_started))
+        text = f"Thinking {elapsed}s · esc stop"
+        if self._queued_messages:
+            text += f" · {len(self._queued_messages)} queued"
+        return text
+
+    def _tick_thinking(self) -> None:
+        if self._is_busy:
+            self._set_activity_status(self._thinking_status_text())
+
+    def _start_thinking(self) -> None:
+        self._thinking_started = time.monotonic()
+        self._tick_thinking()
+        if self._thinking_timer is None:
+            self._thinking_timer = self.set_interval(1.0, self._tick_thinking)
+
+    def _stop_thinking(self) -> None:
+        if self._thinking_timer is not None:
+            self._thinking_timer.stop()
+            self._thinking_timer = None
+
+    async def _drain_queue_async(self) -> None:
+        if self._is_busy or not self._queued_messages:
+            return
+        await self.submit_user_input(self._queued_messages.pop(0))
 
     # ------------------------------------------------------------------
     # Keybinding Actions
     # ------------------------------------------------------------------
     def action_toggle_sidebar(self) -> None:
         sidebar = self.query_one("#sidebar", VerticalScroll)
-        sidebar.toggle_class("hidden")
+        currently_visible = not sidebar.has_class("hidden")
+        self._sidebar_override = not currently_visible
+        self._apply_layout()
 
     def action_refresh_data(self) -> None:
         self.run_worker(self._refresh_all_data_async(), exclusive=False)
 
     def action_quick_plan(self) -> None:
         self.query_one("#main-tabs", TabbedContent).active = "tab-chat"
-        self.query_one("#mode-select", Select).value = "plan"
+        self._set_mode("plan")
         chat_input = self.query_one("#chat-input", Input)
         if not chat_input.value.startswith("/plan"):
             chat_input.value = "/plan "
             chat_input.cursor_position = len(chat_input.value)
         chat_input.focus()
+
+    def action_stop_turn(self) -> None:
+        if self._is_busy and self._busy_task is not None and not self._busy_task.done():
+            self._set_activity_status("Stopping...")
+            self._busy_task.cancel()
+
+    def action_quit_small(self) -> None:
+        if self._is_too_small:
+            self.exit()
 
     async def action_clear_chat(self) -> None:
         await self._clear_chat_history()
@@ -1055,6 +1562,7 @@ class KinesisTUI(App[None]):
         curated = ScienceLiteratureClient.get_curated_evidence(topic)
         md = format_evidence_markdown(curated=curated)
         self.query_one("#evidence-markdown", Markdown).update(md)
+        self._evidence_initialized = True
 
     async def _refresh_all_data_async(self) -> None:
         await asyncio.gather(
@@ -1132,19 +1640,30 @@ class KinesisTUI(App[None]):
                 analyze_training_and_wellness.invoke, {"days_back": days}
             )
 
+        as_of = _clock_now()
         await self.query_one("#sidebar-readiness", Markdown).update(
-            format_readiness_sidebar_markdown(report)
+            format_readiness_sidebar_markdown(report, as_of=as_of)
         )
         await self.query_one("#analytics-markdown", Markdown).update(
-            format_analytics_dashboard_markdown(report)
+            format_analytics_dashboard_markdown(report, as_of=as_of)
         )
 
         if "load_and_form" in report:
             lf = report["load_and_form"]
-            hrv = report.get("recovery_and_wellness", {}).get("hrv", {}).get("rolling_7d_mean")
-            hrv_part = f" · HRV {hrv}ms" if hrv else ""
+            hrv = (
+                report.get("recovery_and_wellness", {})
+                .get("hrv", {})
+                .get("rolling_7d_mean")
+            )
+            hrv_part = f" · HRV {_fmt(hrv)}ms" if hrv is not None else ""
             self.query_one("#top-telemetry", Static).update(
-                f"CTL {lf.get('ctl_fitness', '—')} · ATL {lf.get('atl_fatigue', '—')} · TSB {lf.get('tsb_form', '—')}{hrv_part}"
+                f"CTL {_fmt(lf.get('ctl_fitness'))} · "
+                f"ATL {_fmt(lf.get('atl_fatigue'))} · "
+                f"TSB {_fmt(lf.get('tsb_form'))}{hrv_part} · as of {as_of}"
+            )
+        else:
+            self.query_one("#top-telemetry", Static).update(
+                "no Intervals.icu data · ctrl+r to retry"
             )
 
         # Build enriched lookup from recent_runs & strength_sessions
@@ -1169,12 +1688,30 @@ class KinesisTUI(App[None]):
             merged = {**row, **detailed_by_key.get(key, {})}
             enriched_rows.append(merged)
             table.add_row(
-                str(merged.get("date") or "")[5:],
-                str(merged.get("type") or ""),
-                str(merged.get("name") or "")[:30],
-                str(merged.get("distance_km") if merged.get("distance_km") is not None else "—"),
-                str(merged.get("duration_min") if merged.get("duration_min") is not None else "—"),
-                str(merged.get("load") if merged.get("load") is not None else "—"),
+                _table_cell(_short_date(merged.get("date"))),
+                _table_cell(merged.get("type") or "—"),
+                _table_cell(merged.get("name") or "Untitled"),
+                _table_cell(
+                    merged.get("distance_km")
+                    if merged.get("distance_km") is not None
+                    else "—",
+                    width=4,
+                    right=True,
+                ),
+                _table_cell(
+                    merged.get("duration_min")
+                    if merged.get("duration_min") is not None
+                    else "—",
+                    width=3,
+                    right=True,
+                ),
+                _table_cell(
+                    merged.get("load")
+                    if merged.get("load") is not None
+                    else "—",
+                    width=4,
+                    right=True,
+                ),
             )
 
         self._activities_cache = enriched_rows
@@ -1182,12 +1719,14 @@ class KinesisTUI(App[None]):
             await self.query_one("#activity-detail", Markdown).update(
                 self._format_activity_detail_markdown(enriched_rows[0])
             )
-            status_widget.update(f"Window: {days}d · {len(enriched_rows)} activities")
+            status_widget.update(
+                f"Window: {days}d · {len(enriched_rows)} activities · {as_of}"
+            )
         else:
             await self.query_one("#activity-detail", Markdown).update(
                 "*No completed activities in this window.*"
             )
-            status_widget.update(f"Window: {days}d")
+            status_widget.update(f"Window: {days}d · {as_of}")
 
         return report
 
@@ -1221,13 +1760,17 @@ class KinesisTUI(App[None]):
                 else "—"
             )
             cal_table.add_row(
-                str(ev.get("start_date_local") or "")[:10],
-                str(ev.get("type") or "—"),
-                str(ev.get("category") or "—"),
-                str(ev.get("name") or "Untitled")[:36],
-                str(mins),
-                str(ev.get("icu_training_load") or "—"),
-                str(ev.get("id") or ""),
+                _table_cell(_short_date(ev.get("start_date_local"))),
+                _table_cell(ev.get("type") or "—"),
+                _table_cell(ev.get("name") or "Untitled"),
+                _table_cell(mins, width=4, right=True),
+                _table_cell(
+                    ev.get("icu_training_load")
+                    if ev.get("icu_training_load") is not None
+                    else "—",
+                    width=5,
+                    right=True,
+                ),
             )
 
     # ------------------------------------------------------------------
@@ -1257,19 +1800,59 @@ class KinesisTUI(App[None]):
         router: str = "",
         mode: str = "auto",
     ) -> None:
-        pipe_str = " → ".join(pipeline) if pipeline else "auto"
+        pipe_str = " > ".join(pipeline) if pipeline else "auto"
         self.query_one("#sidebar-pipeline", Static).update(f"Route: {pipe_str}")
+
+    def _render_confirmation_summary(self) -> None:
+        """Wrap the confirmation summary into at most two ellipsized lines."""
+        if not self.pending_confirmations:
+            self.query_one("#confirmation-summary", Static).update("")
+            return
+        text = "Confirm: " + " | ".join(
+            p.summary for p in self.pending_confirmations
+        )
+        width = 0
+        try:
+            width = self.query_one("#chat-main", Vertical).content_size.width - 3
+        except Exception:  # noqa: BLE001
+            pass
+        if width <= 0:
+            try:
+                banner = self.query_one("#confirmation-bar", ConfirmationBanner)
+                width = banner.content_size.width
+            except Exception:  # noqa: BLE001
+                width = 0
+        if width <= 0:
+            sidebar_visible = not self.query_one(
+                "#sidebar", VerticalScroll
+            ).has_class("hidden")
+            width = self.size.width - (36 if sidebar_visible else 0) - 6
+        width = max(16, width)
+        lines = textwrap.wrap(text, width=width) or [text]
+        if len(lines) > 2:
+            lines = lines[:2]
+            lines[-1] = lines[-1][: max(1, width - 1)].rstrip() + "…"
+        self.query_one("#confirmation-summary", Static).update("\n".join(lines))
 
     def _update_confirmation_banner(self) -> None:
         banner = self.query_one("#confirmation-bar", ConfirmationBanner)
-        summary_widget = self.query_one("#confirmation-summary", Static)
         if self.pending_confirmations:
-            summaries = " | ".join(p.summary for p in self.pending_confirmations)
-            summary_widget.update(f"Confirm: {summaries}")
+            self._render_confirmation_summary()
             banner.add_class("visible")
+            self.call_after_refresh(self._render_confirmation_summary)
+            if not self._is_too_small:
+                try:
+                    banner.focus()
+                except Exception:  # noqa: BLE001
+                    pass
         else:
-            summary_widget.update("")
+            self.query_one("#confirmation-summary", Static).update("")
             banner.remove_class("visible")
+            if not self._is_too_small:
+                try:
+                    self.query_one("#chat-input", Input).focus()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _render_new_messages(
         self, messages: list[AnyMessage], start_idx: int
@@ -1303,6 +1886,8 @@ class KinesisTUI(App[None]):
     async def _clear_chat_history(self) -> None:
         self.conversation_messages.clear()
         self.pending_confirmations.clear()
+        self._queued_messages.clear()
+        self._set_mode("auto")
         self._update_confirmation_banner()
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         await scroll.remove_children()
@@ -1321,7 +1906,11 @@ class KinesisTUI(App[None]):
     async def submit_user_input(self, raw_input: str) -> None:
         """Process a user chat message or slash command."""
         user_input = raw_input.strip()
-        if not user_input or self._is_busy:
+        if not user_input:
+            return
+        if self._is_busy:
+            self._queued_messages.append(user_input)
+            self._set_activity_status(self._thinking_status_text())
             return
 
         cmd = user_input.lower()
@@ -1337,6 +1926,7 @@ class KinesisTUI(App[None]):
             await self._append_chat_card("you", "`/status`", role_class="role-user")
             md = await self._refresh_status_async()
             await self._append_chat_card("system", md, role_class="role-system")
+            self._set_mode("auto")
             return
 
         if cmd == "/analyze" or cmd.startswith("/analyze "):
@@ -1351,6 +1941,7 @@ class KinesisTUI(App[None]):
                 role_class="agent-analyst",
             )
             self._set_activity_status("")
+            self._set_mode("auto")
             return
 
         if cmd == "/evidence" or cmd.startswith("/evidence "):
@@ -1366,9 +1957,10 @@ class KinesisTUI(App[None]):
                 md,
                 role_class="agent-researcher",
             )
+            self._set_mode("auto")
             return
 
-        selected_mode = str(self.query_one("#mode-select", Select).value or "auto")
+        selected_mode = self._mode
         prompt_text = user_input
         if user_input == "/plan" or cmd.startswith("/plan "):
             plan_req = user_input[len("/plan") :].strip()
@@ -1383,6 +1975,8 @@ class KinesisTUI(App[None]):
 
     async def _execute_agent_turn_async(self, prompt_text: str, mode: str = "auto") -> None:
         self._is_busy = True
+        self._busy_task = asyncio.current_task()
+        self._start_thinking()
         try:
             await self._append_chat_card(
                 title="you",
@@ -1391,7 +1985,7 @@ class KinesisTUI(App[None]):
             )
             self.conversation_messages.append(HumanMessage(content=prompt_text))
             prev_len = len(self.conversation_messages)
-            self._set_activity_status("Thinking...")
+            self._set_activity_status(self._thinking_status_text())
 
             graph = self._get_graph()
             initial_state = {
@@ -1422,11 +2016,21 @@ class KinesisTUI(App[None]):
             self._update_confirmation_banner()
 
             if self.pending_confirmations:
-                self._set_activity_status("Awaiting confirmation.")
+                self._set_activity_status("Awaiting confirmation · a approve · r reject")
             elif _pending_question(self.conversation_messages):
                 self._set_activity_status("Awaiting your reply.")
             else:
                 self._set_activity_status("")
+        except asyncio.CancelledError:
+            try:
+                await self._append_chat_card(
+                    title="system",
+                    markdown_text="*Stopped.*",
+                    role_class="role-system",
+                )
+            except Exception:  # noqa: BLE001 - app may be shutting down
+                pass
+            self._set_activity_status("Stopped.")
         except Exception as exc:  # noqa: BLE001
             await self._append_chat_card(
                 title="error",
@@ -1436,12 +2040,28 @@ class KinesisTUI(App[None]):
             self._set_activity_status("")
         finally:
             self._is_busy = False
+            self._busy_task = None
+            self._stop_thinking()
+            self._set_mode("auto")
+            if self.pending_confirmations:
+                try:
+                    self.query_one("#confirmation-bar", ConfirmationBanner).focus()
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not self._is_too_small:
+                try:
+                    self.query_one("#chat-input", Input).focus()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._queued_messages:
+                self.run_worker(self._drain_queue_async(), group="chat", exclusive=True)
 
     async def approve_pending_confirmations(self) -> None:
         """Approve and execute all currently pending intervals.icu confirmations."""
         if not self.pending_confirmations or self._is_busy:
             return
         self._is_busy = True
+        self._busy_task = asyncio.current_task()
         to_run = list(self.pending_confirmations)
         self.pending_confirmations.clear()
         self._update_confirmation_banner()
@@ -1464,8 +2084,25 @@ class KinesisTUI(App[None]):
                 )
             await self._refresh_calendar_and_library_async()
             self._set_activity_status("")
+        except asyncio.CancelledError:
+            self._set_activity_status("Stopped.")
+        except Exception as exc:  # noqa: BLE001
+            await self._append_chat_card(
+                title="error",
+                markdown_text=f"`{exc}`",
+                role_class="role-system",
+            )
+            self._set_activity_status("")
         finally:
             self._is_busy = False
+            self._busy_task = None
+            self._stop_thinking()
+            try:
+                self.query_one("#chat-input", Input).focus()
+            except Exception:  # noqa: BLE001
+                pass
+            if self._queued_messages:
+                self.run_worker(self._drain_queue_async(), group="chat", exclusive=True)
 
     async def reject_pending_confirmations(self) -> None:
         """Reject and discard currently pending intervals.icu confirmations."""
@@ -1501,6 +2138,7 @@ class KinesisTUI(App[None]):
             curated = client.get_curated_evidence(topic)
             md = format_evidence_markdown(curated=curated)
         await self.query_one("#evidence-markdown", Markdown).update(md)
+        self._evidence_initialized = True
         return md
 
     # ------------------------------------------------------------------
@@ -1508,15 +2146,15 @@ class KinesisTUI(App[None]):
     # ------------------------------------------------------------------
     @on(Input.Submitted, "#chat-input")
     async def _on_chat_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value
+        text = event.value.strip()
+        if not text:
+            return
+        if self._is_busy:
+            self._queued_messages.append(text)
+            event.input.value = ""
+            self._set_activity_status(self._thinking_status_text())
+            return
         event.input.value = ""
-        await self.submit_user_input(text)
-
-    @on(Button.Pressed, "#btn-send")
-    async def _on_send_pressed(self) -> None:
-        chat_input = self.query_one("#chat-input", Input)
-        text = chat_input.value
-        chat_input.value = ""
         await self.submit_user_input(text)
 
     @on(Button.Pressed, "#btn-approve-confirm")
@@ -1637,8 +2275,12 @@ class KinesisTUI(App[None]):
         if 0 <= idx < len(self._calendar_events_cache):
             ev = self._calendar_events_cache[idx]
             desc = ev.get("description") or "*No structured steps.*"
+            event_id = ev.get("id")
+            id_part = f" · ID `#{event_id}`" if event_id is not None else ""
             detail_md = (
-                f"**{ev.get('name', 'Event')}** (`{str(ev.get('start_date_local') or '')[:10]}` · `{ev.get('type', '—')}`)\n\n"
+                f"**{ev.get('name') or 'Event'}** "
+                f"(`{str(ev.get('start_date_local') or '')[:10]}` · "
+                f"`{ev.get('type') or '—'}`{id_part})\n\n"
                 f"```text\n{desc}\n```"
             )
             await self.query_one("#calendar-event-detail", Markdown).update(detail_md)
